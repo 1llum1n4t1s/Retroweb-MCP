@@ -30,7 +30,7 @@ import {
 
 const server = new McpServer({
   name: "retroweb",
-  version: "0.1.1",
+  version: "1.0.0",
 });
 
 /** ツールの戻り値を MCP のテキストコンテンツに整形する */

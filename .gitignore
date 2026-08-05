@@ -3,3 +3,6 @@ dist/
 *.log
 .env
 .DS_Store
+
+# ローカル開発ツール（Serena）のプロジェクト設定。初回起動時に自動生成される
+.serena/

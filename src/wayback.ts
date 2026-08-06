@@ -6,7 +6,7 @@
  * 実際に到達できる唯一の経路になる。このモジュールはその 2 つを提供する。
  */
 
-import { fetchHtml, fetchJson } from "./http.js";
+import { fetchHtml, fetchJson, fetchText } from "./http.js";
 
 /**
  * 利用者が渡す URL はスキームを欠くことが多い（'geocities.co.jp/Playtown' など）。
@@ -120,38 +120,189 @@ export async function cdxSearch(params: CdxSearchParams): Promise<CdxRecord[]> {
 }
 
 /**
- * CDX を resumeKey で辿りながら、指定件数に達するまでレコードを集める。
- * prefix 検索は 1 サイトの画像群だけで limit を食い潰すため、
- * 「どんなサイトが存在するか」を知るには複数ページ分を舐める必要がある。
+ * 走査に使う共通クエリを組み立てる（ページ指定と resumeKey 以外の部分）。
  */
-async function cdxPaged(
+function scanQuery(params: CdxSearchParams): URLSearchParams {
+  const query = new URLSearchParams({
+    url: params.url,
+    output: "json",
+    matchType: params.matchType ?? "prefix",
+    fl: "original,timestamp,statuscode,mimetype",
+    collapse: "urlkey",
+  });
+  const from = normalizeDate(params.from);
+  const to = normalizeDate(params.to);
+  if (from) query.set("from", from);
+  if (to) query.set("to", to);
+  if (params.onlyOk !== false) query.append("filter", "statuscode:200");
+  if (params.mimeType) query.append("filter", `mimetype:${params.mimeType}`);
+  return query;
+}
+
+/** CDX の 1 行を CdxRecord へ。ヘッダ行・resumeKey 行・空行は null で弾く。 */
+function toRecord(row: string[]): CdxRecord | null {
+  if (!Array.isArray(row) || row.length < 2 || !row[0] || !row[1]) return null;
+  return {
+    original: row[0],
+    timestamp: row[1],
+    statuscode: row[2] ?? "",
+    mimetype: row[3] ?? "",
+    snapshotUrl: snapshotUrl(row[1], row[0]),
+  };
+}
+
+/**
+ * CDX インデックスの総ブロック数を得る。
+ *
+ * ブロックは URL キー順に切られた索引の区画で、1 区画あたり実測 300〜1300 行。
+ * `page=` を付けた取得はこの区画 1 つ分しか読まないため、対象がどれだけ巨大でも
+ * サーバ側の処理が有界になる（＝タイムアウトしない）。
+ */
+async function cdxNumPages(params: CdxSearchParams): Promise<number> {
+  const query = scanQuery(params);
+  query.set("showNumPages", "true");
+  // showNumPages は件数だけを平文で返す。output=json と fl を残すと
+  // その指定が出力側に適用され、数字の代わりに '- - - -' が返る（実測）。
+  query.delete("output");
+  query.delete("fl");
+  const body = await fetchText(`${CDX_ENDPOINT}?${query}`, { timeoutMs: 45_000 });
+  const n = Number(body.trim());
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** totalPages のうち want ページ分を、範囲全体へ均等に散らして選ぶ */
+function spreadPages(totalPages: number, want: number): number[] {
+  if (want >= totalPages) return Array.from({ length: totalPages }, (_, i) => i);
+  // 端に寄せず等間隔に取る。ジオシティーズはエリア名の辞書順に並ぶため、
+  // 先頭から順に取ると 1〜2 エリアだけで件数を使い切ってしまう。
+  return Array.from({ length: want }, (_, i) =>
+    Math.min(totalPages - 1, Math.floor(((i + 0.5) * totalPages) / want)),
+  );
+}
+
+/**
+ * 1 ブロックから実際に取れる行数の見積り。
+ *
+ * ブロックの生の行数は 300〜1300 だが、そこへ年代・ステータス・MIME の絞り込みが
+ * 掛かるため手元に残るのはずっと少ない。ここを大きく見積もるとブロックを数枚しか
+ * 読まずに終わり、ホスト全体を指定したときの収穫が激減する。
+ */
+const ROWS_PER_PAGE_ESTIMATE = 250;
+
+/** 1 回の走査で読むブロック数の下限・上限（1 ブロックあたり実測 0.7〜1.7 秒） */
+const MIN_SCAN_PAGES = 4;
+const MAX_SCAN_PAGES = 24;
+
+export interface ScanResult {
+  records: CdxRecord[];
+  /** CDX 索引の総ブロック数（対象の規模） */
+  totalPages: number;
+  /** 実際に読んだブロック数 */
+  scannedPages: number;
+  /** 全ブロックを読み切れず、間引いて標本抽出したか */
+  sampled: boolean;
+  /** ページ分割 API が使えず旧方式へ落ちたときの説明 */
+  note?: string;
+}
+
+/**
+ * CDX を走査してレコードを集める。
+ *
+ * ホスト全体のような広い prefix を素の limit 付きクエリで叩くと、CDX が索引を
+ * 端から舐めるためサーバ側が 60 秒で 504 を返す（`www.geocities.co.jp` の 1 年分で実測）。
+ * ページ分割 API は 1 リクエストを 1 ブロックに限定するので、対象の広さに関わらず
+ * 数秒で返る。ここではまず総ブロック数を得てから、範囲全体へ散らしてブロックを読む。
+ */
+async function cdxScan(
   params: CdxSearchParams,
   maxRecords: number,
-  maxPages = 10,
-): Promise<CdxRecord[]> {
+  maxRequests = Math.min(
+    MAX_SCAN_PAGES,
+    Math.max(MIN_SCAN_PAGES, Math.ceil(maxRecords / ROWS_PER_PAGE_ESTIMATE)),
+  ),
+): Promise<ScanResult> {
+  let totalPages = 0;
+  try {
+    totalPages = await cdxNumPages(params);
+  } catch {
+    /* ページ分割 API が使えない場合は下の resumeKey 方式へ落ちる */
+  }
+
+  if (totalPages > 0) {
+    // 予算いっぱいのブロックを範囲全体へ散らして選ぶ。
+    const pages = spreadPages(totalPages, maxRequests);
+    // 件数の予算はブロックへ均等に配る。前詰めで取ると、行数の多いブロックが
+    // 数枚あるだけで予算を使い切り、結果が索引の狭い範囲（＝少数のエリア）に偏る。
+    const perPage = Math.max(1, Math.ceil(maxRecords / pages.length));
+    const records: CdxRecord[] = [];
+    let scannedPages = 0;
+
+    for (const page of pages) {
+      if (records.length >= maxRecords) break;
+      const query = scanQuery(params);
+      query.set("page", String(page));
+
+      // 1 ブロックが読めなくても走査全体は続ける（IA は個別ブロックで 5xx を返すことがある）。
+      let rows: string[][];
+      try {
+        rows = await fetchJson<string[][]>(`${CDX_ENDPOINT}?${query}`);
+      } catch {
+        continue;
+      }
+      scannedPages++;
+      if (!Array.isArray(rows) || rows.length < 2) continue;
+
+      let taken = 0;
+      for (const row of rows.slice(1)) {
+        if (taken >= perPage || records.length >= maxRecords) break;
+        const rec = toRecord(row);
+        if (rec) {
+          records.push(rec);
+          taken++;
+        }
+      }
+    }
+
+    if (scannedPages > 0) {
+      return {
+        records,
+        totalPages,
+        scannedPages,
+        sampled: scannedPages < totalPages,
+      };
+    }
+  }
+
+  return {
+    ...(await cdxResumeScan(params, maxRecords, maxRequests)),
+    note: "CDX のページ分割 API が使えなかったため resumeKey 方式で取得しました。対象が広いと途中で打ち切られることがあります。",
+  };
+}
+
+/**
+ * 旧来の resumeKey 走査。ページ分割 API が使えないときの退避経路。
+ *
+ * 索引の先頭から順に読むため、広い prefix では 504 になるか、
+ * 返ってきても辞書順で先頭のエリアに偏る。
+ */
+async function cdxResumeScan(
+  params: CdxSearchParams,
+  maxRecords: number,
+  maxPages: number,
+): Promise<Omit<ScanResult, "note">> {
   const collected: CdxRecord[] = [];
   let resumeKey: string | undefined;
+  let scannedPages = 0;
 
   for (let page = 0; page < maxPages && collected.length < maxRecords; page++) {
-    const query = new URLSearchParams({
-      url: params.url,
-      output: "json",
-      matchType: params.matchType ?? "prefix",
-      limit: String(Math.min(1000, maxRecords - collected.length)),
-      fl: "original,timestamp,statuscode,mimetype",
-      collapse: "urlkey",
-      showResumeKey: "true",
-    });
-    const from = normalizeDate(params.from);
-    const to = normalizeDate(params.to);
-    if (from) query.set("from", from);
-    if (to) query.set("to", to);
-    if (params.onlyOk !== false) query.append("filter", "statuscode:200");
-    if (params.mimeType) query.append("filter", `mimetype:${params.mimeType}`);
+    const query = scanQuery(params);
+    query.set("limit", String(Math.min(1000, maxRecords - collected.length)));
+    query.set("showResumeKey", "true");
     if (resumeKey) query.set("resumeKey", resumeKey);
 
     const rows = await fetchJson<string[][]>(`${CDX_ENDPOINT}?${query}`);
     if (!Array.isArray(rows) || rows.length < 2) break;
+    scannedPages++;
 
     const [, ...data] = rows;
 
@@ -165,21 +316,15 @@ async function cdxPaged(
     }
 
     for (const row of data) {
-      if (row.length < 2 || !row[0]) continue;
-      collected.push({
-        original: row[0],
-        timestamp: row[1],
-        statuscode: row[2] ?? "",
-        mimetype: row[3] ?? "",
-        snapshotUrl: snapshotUrl(row[1], row[0]),
-      });
+      const rec = toRecord(row);
+      if (rec) collected.push(rec);
     }
 
     if (!nextKey) break;
     resumeKey = nextKey;
   }
 
-  return collected;
+  return { records: collected, totalPages: 0, scannedPages, sampled: false };
 }
 
 /**
@@ -203,17 +348,24 @@ export function siteRootOf(rawUrl: string): string | null {
   const tilde = segments.findIndex((s) => s.startsWith("~"));
   if (tilde >= 0) return `http://${host}/${segments.slice(0, tilde + 1).join("/")}/`;
 
-  // ジオシティーズ日本: /<エリア名>/<番地>/ の 2 階層でひとつのサイト
+  // ジオシティーズ日本: /<エリア名>/<番地>/ の 2 階層でひとつのサイト。
+  // 番地（数字）を必須にする。これが無いものは /advertise/ /aboutgeo/ /addbook.html の
+  // ようなサービス側のページで、個人サイトではない。
   if (/geocities\.co\.jp$/i.test(host)) {
-    if (segments.length >= 2 && /^\d+$/.test(segments[1])) {
-      return `http://${host}/${segments[0]}/${segments[1]}/`;
-    }
-    return `http://${host}/${segments[0]}/`;
+    return segments.length >= 2 && /^\d+$/.test(segments[1])
+      ? `http://${host}/${segments[0]}/${segments[1]}/`
+      : null;
   }
 
-  // その他は先頭 1 階層をユーザー領域とみなす
+  // その他は先頭 1 階層をユーザー領域とみなす。
+  // ただし先頭がファイル名（index.html 等）ならホスト直下の 1 枚ページで、
+  // ユーザー領域ではないので数えない。
+  if (FILE_SEGMENT_RE.test(segments[0])) return null;
   return `http://${host}/${segments[0]}/`;
 }
+
+/** 拡張子付きのパス片＝ディレクトリではなくファイル */
+const FILE_SEGMENT_RE = /\.(html?|shtml|cgi|php|txt|gif|jpe?g|png|zip|lzh|pdf)$/i;
 
 export interface DiscoveredSite {
   siteRoot: string;
@@ -234,12 +386,29 @@ export interface DiscoveredSite {
   sampleTimestamp: string;
 }
 
+export interface DiscoverResult {
+  sites: DiscoveredSite[];
+  /** CDX 索引の総ブロック数。対象の規模を表す */
+  totalPages: number;
+  /** 実際に読んだブロック数 */
+  scannedPages: number;
+  /**
+   * 全ブロックを読み切れず標本抽出になったか。
+   * true のとき、返ったサイト一覧は網羅ではなく URL キー空間全体からの抜き取り。
+   */
+  sampled: boolean;
+  note?: string;
+}
+
 /**
  * あるホスト／エリア配下に「どんな個人サイトが存在したか」を列挙する。
  *
  * 素の CDX 検索はファイル単位で返るため 1 サイトの画像群に埋もれてしまう。
- * ここではページを跨いで収集したうえでサイト根ごとに畳み、
+ * ここではブロックを跨いで収集したうえでサイト根ごとに畳み、
  * 検索エンジンに載っていないサイトの一覧そのものを取り出す。
+ *
+ * ホスト名だけ（`www.geocities.co.jp`）のような広い指定でも落ちない。
+ * 索引の走査は cdxScan がブロック単位に分割して行う。
  */
 export async function discoverSites(params: {
   url: string;
@@ -247,10 +416,10 @@ export async function discoverSites(params: {
   to?: string;
   maxRecords?: number;
   htmlOnly?: boolean;
-}): Promise<DiscoveredSite[]> {
+}): Promise<DiscoverResult> {
   const { url, from, to, maxRecords = 3000, htmlOnly = true } = params;
 
-  const records = await cdxPaged(
+  const scan = await cdxScan(
     {
       url,
       matchType: "prefix",
@@ -263,7 +432,7 @@ export async function discoverSites(params: {
   );
 
   const grouped = new Map<string, DiscoveredSite>();
-  for (const rec of records) {
+  for (const rec of scan.records) {
     const root = siteRootOf(rec.original);
     if (!root) continue;
 
@@ -287,7 +456,13 @@ export async function discoverSites(params: {
   }
 
   // ファイル数が多いサイトほど中身があった＝読む価値が高い
-  return [...grouped.values()].sort((a, b) => b.observedFiles - a.observedFiles);
+  return {
+    sites: [...grouped.values()].sort((a, b) => b.observedFiles - a.observedFiles),
+    totalPages: scan.totalPages,
+    scannedPages: scan.scannedPages,
+    sampled: scan.sampled,
+    note: scan.note,
+  };
 }
 
 export interface AvailabilityResult {

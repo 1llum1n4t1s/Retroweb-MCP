@@ -23,8 +23,10 @@ import {
 import { buildMarginaliaQuery } from "./marginalia.js";
 import { buildWarpQuery } from "./warp.js";
 import {
+  COMMERCIAL_NOISE_DOMAINS,
   LEGACY_HOSTS,
   PERIOD_PHRASES,
+  buildPhraseQueries,
   buildSiteQueries,
 } from "./legacy-domains.js";
 
@@ -127,7 +129,8 @@ server.registerTool(
       url: z
         .string()
         .describe(
-          "ホストまたはエリアの prefix。例: 'www.geocities.co.jp/Playtown-Bingo' 'homepage1.nifty.com'",
+          "ホストまたはエリアの prefix。例: 'www.geocities.co.jp/Playtown-Bingo' 'homepage1.nifty.com'。" +
+            "'www.geocities.co.jp' のようにホスト名だけでも可（索引全体から散らして標本抽出する）",
         ),
       from: z.string().optional().describe("開始年。例 '1998'"),
       to: z.string().optional().describe("終了年。例 '2002'"),
@@ -147,14 +150,34 @@ server.registerTool(
   },
   async ({ url, from, to, maxRecords, htmlOnly, limit = 100 }) =>
     guard(async () => {
-      const sites = await discoverSites({ url, from, to, maxRecords, htmlOnly });
+      const { sites, totalPages, scannedPages, sampled, note } =
+        await discoverSites({ url, from, to, maxRecords, htmlOnly });
+
+      const hints: string[] = [];
+      if (sites.length === 0) {
+        hints.push(
+          "0 件でした。prefix が細かすぎるか、そのホストがアーカイブされていない可能性があります。legacy_hosts でホスト名を確認してください。",
+        );
+      } else {
+        hints.push(
+          "observedFiles が多いサイトほど中身が充実していた傾向があります。siteRoot を wayback_fetch_page / wayback_outlinks に渡して掘り下げてください。",
+          "latestFirstSeen は『少なくともこの時点まで存在した』下限値で、最新キャプチャではありません（知りたいときは siteRoot を wayback_snapshot へ）。",
+        );
+      }
+      if (sampled) {
+        hints.push(
+          `索引 ${totalPages} ブロック中 ${scannedPages} ブロックだけを読んだ標本です（網羅ではありません）。` +
+            "同じ指定で呼び直しても同じ標本が返ります。網羅したいときは maxRecords を上げるか、" +
+            "siteRoot に出てきたエリア名（例 '<host>/Playtown-Bingo'）まで絞って呼び直してください。",
+        );
+      }
+      if (note) hints.push(note);
+
       return {
         totalSites: sites.length,
-        hint:
-          sites.length === 0
-            ? "0 件でした。prefix が細かすぎるか、そのホストがアーカイブされていない可能性があります。legacy_hosts でホスト名を確認してください。"
-            : "observedFiles が多いサイトほど中身が充実していた傾向があります。siteRoot を wayback_fetch_page / wayback_outlinks に渡して掘り下げてください。" +
-              "latestFirstSeen は『少なくともこの時点まで存在した』下限値で、最新キャプチャではありません（知りたいときは siteRoot を wayback_snapshot へ）。",
+        // 標本抽出かどうかは結果の解釈を変えるので、必ず一緒に返す
+        coverage: { totalPages, scannedPages, sampled },
+        hint: hints.join(" "),
         sites: sites.slice(0, limit),
       };
     }),
@@ -301,6 +324,8 @@ server.registerTool(
       "現行の検索エンジン（Google / Bing 等）に投げるための、当時のホストを site: で絞り込んだ" +
       "クエリ群と、90年代特有の言い回し（リンクフリー、キリ番、相互リンク募集、工事中 など）を" +
       "組み合わせた検索語を生成する。素のキーワードより命中率が上がる。" +
+      "サービス終了済みのホストだけを対象にし、現行のショッピングサイトを除外する句を付けるため、" +
+      "Yahoo!ショッピングや Amazon の商品ページに流れない。" +
       "生成されたクエリは WebSearch ツールへそのまま渡して使う。",
     inputSchema: {
       keyword: z.string().describe("探したい主題。例: '東方 CG 集' '個人 日記'"),
@@ -312,21 +337,33 @@ server.registerTool(
         .boolean()
         .optional()
         .describe("当時の言い回しを組み合わせたクエリも生成する（既定 true）"),
+      includeModernHosts: z
+        .boolean()
+        .optional()
+        .describe(
+          "事業サイトが現役のドメイン（@nifty、OCN、ac.jp 等）も site: に含める（既定 false）。" +
+            "true にするとヒットの大半が現代のページになる",
+        ),
     },
   },
-  async ({ keyword, categories, includePeriodPhrases = true }) =>
+  async ({ keyword, categories, includePeriodPhrases = true, includeModernHosts = false }) =>
     guard(async () => {
-      const siteQueries = buildSiteQueries(keyword, categories);
+      const siteQueries = buildSiteQueries(keyword, categories, {
+        includeModernHosts,
+      });
       const phraseQueries = includePeriodPhrases
-        ? PERIOD_PHRASES.slice(0, 8).map((p) => `"${p.phrase}" ${keyword}`)
+        ? buildPhraseQueries(keyword)
         : [];
       return {
         siteQueries,
         phraseQueries,
+        excludedDomains: COMMERCIAL_NOISE_DOMAINS,
         periodPhrases: PERIOD_PHRASES,
         hint:
           "siteQueries は 1 本ずつ WebSearch に投げること（OR を繋げすぎると検索側に無視されます）。" +
-          "ヒットしたらその URL を wayback_cdx_search と wayback_outlinks に渡して掘り下げます。",
+          "ヒットしたらその URL を wayback_cdx_search と wayback_outlinks に渡して掘り下げます。" +
+          "なお当時のホストは現行検索の索引からほぼ消えているため、この経路の期待値は低いです。" +
+          "実際に届くのは discover_sites → wayback_outlinks の芋づるなので、そちらを主軸にしてください。",
       };
     }),
 );
@@ -420,6 +457,7 @@ server.registerTool(
           detail:
             "例: url='www.geocities.co.jp/Playtown-Bingo', from='1998', to='2002'。" +
             "ジオシティーズは <エリア名>/<番地>/ が 1 ユーザー。エリア名は Playtown-Bingo のようにハイフン付きの細分がある。" +
+            "エリア名が分からなければ url='www.geocities.co.jp' とホスト名だけでも呼べる（索引全体から散らして標本抽出し、実在したエリア名が siteRoot に出る）。" +
             "ディレクトリ経由より直接的で、検索エンジンに一切載っていないサイトがそのまま出てくる。",
         },
         {
@@ -452,6 +490,12 @@ server.registerTool(
       ],
       pitfalls: [
         "Wayback の CDX は全文検索ではない。ページ内容からは探せないので、必ずドメインか URL 断片を先に手に入れる。",
+        "現行検索エンジンで当時のホストを site: 指定しても、索引から消えているためほぼ 0 件になる。" +
+          "検索側はヒットが乏しいと絞り込みを緩めるので、放っておくと生きているショッピングサイトが返る" +
+          "（実測: site:geocities.co.jp → Yahoo!ショッピング）。build_retro_queries が除外句を付けるが、" +
+          "そもそも step 6 は補助であり、主力は step 2-b と step 5 の芋づる。",
+        "discover_sites にホスト名だけを渡した結果は網羅ではなく標本（coverage.sampled=true）。" +
+          "出てきたエリア名で呼び直すと、そのエリアは網羅に近づく。",
         "WARP は 2002 年以降の収集で、90年代はほぼ入っていない。90年代狙いなら Wayback 一択。",
         "Marginalia は日本語索引が弱く、日本語クエリはほぼ 0 件。",
         "アーカイブに残っていても robots 除外やサーバ消滅で本文が取れないことがある。複数の年代のスナップショットを試す。",

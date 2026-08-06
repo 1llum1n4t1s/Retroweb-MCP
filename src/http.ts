@@ -63,6 +63,32 @@ function retryDelay(attempt: number, hintMs: number): number {
   return Math.min(Math.max(backoff, hintMs), MAX_RETRY_WAIT_MS);
 }
 
+/**
+ * 通信エラーを、原因の分かるメッセージに書き換える。
+ *
+ * Node の fetch は接続断も DNS 失敗も一律 `fetch failed` としか言わず、
+ * 中断（AbortError）に至っては呼び出し側のタイムアウトなのかサーバ側なのか区別できない。
+ * 素通しすると利用者には「MCP が壊れている」ようにしか見えないため、ここで補う。
+ */
+function describeFetchError(err: unknown, url: string, timeoutMs: number): Error {
+  if (err instanceof Error && err.name === "AbortError") {
+    return new Error(
+      `${timeoutMs / 1000} 秒以内に応答がありませんでした: ${url}。対象が広すぎてサーバ側が返しきれない可能性があります。`,
+    );
+  }
+  if (err instanceof Error) {
+    const cause = (err as { cause?: unknown }).cause;
+    const detail =
+      cause instanceof Error
+        ? cause.message
+        : cause !== undefined
+          ? String(cause)
+          : "";
+    return detail ? new Error(`${err.message}（${detail}）: ${url}`) : err;
+  }
+  return new Error(String(err));
+}
+
 async function discardBody(res: Response): Promise<void> {
   try {
     await res.body?.cancel();
@@ -115,7 +141,7 @@ export async function fetchText(
       return await res.text();
     } catch (err) {
       if (err instanceof HttpError) throw err;
-      lastError = err instanceof Error ? err : new Error(String(err));
+      lastError = describeFetchError(err, url, timeoutMs);
     } finally {
       clearTimeout(timer);
     }
@@ -284,7 +310,7 @@ export async function fetchHtml(
       return decodeHtml(await res.arrayBuffer(), headerCharset ?? undefined);
     } catch (err) {
       if (err instanceof HttpError) throw err;
-      lastError = err instanceof Error ? err : new Error(String(err));
+      lastError = describeFetchError(err, url, timeoutMs);
     } finally {
       clearTimeout(timer);
     }

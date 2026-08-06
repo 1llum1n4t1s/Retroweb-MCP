@@ -6,10 +6,15 @@
  * `pnpm smoke` で実行する。
  */
 
-import { cdxSearch, checkAvailability, extractOutlinks, fetchArchivedPage, htmlToText } from "./wayback.js";
+import { cdxSearch, checkAvailability, discoverSites, extractOutlinks, fetchArchivedPage, htmlToText } from "./wayback.js";
 import { buildMarginaliaQuery } from "./marginalia.js";
 import { buildWarpQuery } from "./warp.js";
-import { buildSiteQueries, LEGACY_HOSTS } from "./legacy-domains.js";
+import {
+  COMMERCIAL_NOISE_DOMAINS,
+  LEGACY_HOSTS,
+  buildPhraseQueries,
+  buildSiteQueries,
+} from "./legacy-domains.js";
 
 let failures = 0;
 
@@ -106,6 +111,47 @@ await check("legacy hosts / query builder", async () => {
   const q = buildSiteQueries("日記", ["free-hosting"]);
   if (q.length === 0) throw new Error("クエリ生成 0 件");
   return `ホスト ${LEGACY_HOSTS.length} 件 / クエリ ${q.length} 本 / 例: ${q[0].slice(0, 80)}…`;
+});
+
+// --- 回帰チェック: 現行の商業サイトへ流れないこと ---
+await check("buildSiteQueries (現役ドメインを既定で含めない)", async () => {
+  const modern = LEGACY_HOSTS.filter((h) => h.searchIndex === "modern");
+  if (modern.length === 0) throw new Error("modern 区分のホストが 1 件も無い");
+  const joined = buildSiteQueries("日記").join(" ");
+  const leaked = modern.filter((h) => joined.includes(`site:${h.domain} `) ||
+    joined.includes(`site:${h.domain})`));
+  if (leaked.length > 0) {
+    throw new Error(`現役ドメインが混入: ${leaked.map((h) => h.domain).join(", ")}`);
+  }
+  return `retro ${LEGACY_HOSTS.length - modern.length} 件のみ使用 / modern ${modern.length} 件を除外`;
+});
+
+await check("buildSiteQueries / buildPhraseQueries (商業ドメイン除外句が付くこと)", async () => {
+  const all = [...buildSiteQueries("日記"), ...buildPhraseQueries("日記", 3)];
+  const missing = all.filter(
+    (q) => !COMMERCIAL_NOISE_DOMAINS.every((d) => q.includes(`-site:${d}`)),
+  );
+  if (missing.length > 0) throw new Error(`除外句が欠けたクエリ ${missing.length} 本`);
+  return `全 ${all.length} 本に ${COMMERCIAL_NOISE_DOMAINS.length} 件の除外句`;
+});
+
+// --- 回帰チェック: ホスト名だけの指定で落ちないこと ---
+// 以前は CDX がホスト全体を端から舐めて 60 秒で 504 を返し、'fetch failed' になっていた。
+await check("discoverSites (ホスト名だけ: www.geocities.co.jp)", async () => {
+  const r = await discoverSites({
+    url: "www.geocities.co.jp",
+    from: "1997",
+    to: "2002",
+    maxRecords: 1500,
+  });
+  if (r.sites.length === 0) throw new Error("0 件");
+  if (r.totalPages === 0) throw new Error("ページ分割 API が使われず旧方式へ落ちた");
+  const areas = new Set(r.sites.map((s) => s.siteRoot.split("/")[3]));
+  // 索引は URL キー順なので、散らして読めていなければエリアが 1〜2 種に偏る
+  if (areas.size < 3) {
+    throw new Error(`エリアが偏っている（${areas.size} 種）: ${[...areas].join(", ")}`);
+  }
+  return `${r.sites.length} サイト / ${areas.size} エリア / ${r.scannedPages}/${r.totalPages} ブロック`;
 });
 
 console.log(

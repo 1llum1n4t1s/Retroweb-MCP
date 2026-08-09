@@ -1,6 +1,6 @@
 {
   "name": "retroweb-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server for excavating 1990s-2000s Japanese personal websites from web archives",
   "type": "module",
   "main": "dist/index.js",

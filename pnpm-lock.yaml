@@ -16,11 +16,11 @@ importers:
         version: 4.4.3
     devDependencies:
       '@types/node':
-        specifier: ^26.1.2
-        version: 26.1.2
+        specifier: ^26.2.0
+        version: 26.2.0
       tsx:
-        specifier: ^4.19.0
-        version: 4.23.5
+        specifier: ^4.23.11
+        version: 4.23.11
       typescript:
         specifier: ^7.0.2
         version: 7.0.2
@@ -199,8 +199,8 @@ packages:
       '@cfworker/json-schema':
         optional: true
 
-  '@types/node@26.1.2':
-    resolution: {integrity: sha512-Vu4a5UFA9rIIFJ7rB/Vaafh9lrCQszopTCx6KjFboXTGQbPNasehVR5TEiithSDGyd1DEiUByggTZsg8jukeIg==}
+  '@types/node@26.2.0':
+    resolution: {integrity: sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg==}
 
   '@typescript/typescript-aix-ppc64@7.0.2':
     resolution: {integrity: sha512-MTKKkWB7p/0E9xi1d1tHtZ5PiLkGEMIq88pK2CubZjOsLtYTLqhgIgi6zepFa+9GHZ6h05NMCkQxGKiPXMxXtQ==}
@@ -658,8 +658,8 @@ packages:
     resolution: {integrity: sha512-o5sSPKEkg/DIQNmH43V0/uerLrpzVedkUh8tGNvaeXpfpuwjKenlSox/2O/BTlZUtEe+JG7s5YhEz608PlAHRA==}
     engines: {node: '>=0.6'}
 
-  tsx@4.23.5:
-    resolution: {integrity: sha512-rw55FUaqOoI7RvlQwLbhO4nSDApnQ4/CykPuiQ/EPvtrX3WA9Ig55jIt9VvbBJbzJuj12ueRu4PMZ2SxPVbihg==}
+  tsx@4.23.11:
+    resolution: {integrity: sha512-Ry2oTEUnhBdeEdWIztY8kf3/nBGnPnjMLVGL0YfdRXMORuPER5NlKmayqxtxRxwB1xBN+RivRaJfe7PM1rtiyw==}
     engines: {node: '>=18.0.0'}
     hasBin: true
 
@@ -805,7 +805,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  '@types/node@26.1.2':
+  '@types/node@26.2.0':
     dependencies:
       undici-types: 8.3.0
 
@@ -1250,7 +1250,7 @@ snapshots:
 
   toidentifier@1.0.1: {}
 
-  tsx@4.23.5:
+  tsx@4.23.11:
     dependencies:
       esbuild: 0.28.1
     optionalDependencies:

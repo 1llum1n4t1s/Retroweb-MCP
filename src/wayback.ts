@@ -334,6 +334,19 @@ async function cdxResumeScan(
  * ファイル単位の URL をこの規則で畳むと「存在するサイトの一覧」が得られる。
  */
 export function siteRootOf(rawUrl: string): string | null {
+  return siteRootInfo(rawUrl)?.root ?? null;
+}
+
+/**
+ * サイト根と、それをどの規則で決めたか。
+ *
+ * 規則が `generic`（先頭 1 階層をユーザー領域とみなした）ときだけ、後段の
+ * {@link refineNeighborhoods} が実データを見て 1 段深く畳み直す余地がある。
+ * チルダやジオシティーズは規則側で確定しているので触らせない。
+ */
+export function siteRootInfo(
+  rawUrl: string,
+): { root: string; rule: "tilde" | "numbered" | "generic" } | null {
   let u: URL;
   try {
     u = new URL(normalizeUrl(rawUrl));
@@ -344,16 +357,25 @@ export function siteRootOf(rawUrl: string): string | null {
   const segments = u.pathname.split("/").filter(Boolean);
   if (segments.length === 0) return null;
 
-  // チルダ形式（大学・ISP に多い）: /~username/
+  // チルダ形式（大学・ISP に多い。日本も海外も共通）: /~username/
   const tilde = segments.findIndex((s) => s.startsWith("~"));
-  if (tilde >= 0) return `http://${host}/${segments.slice(0, tilde + 1).join("/")}/`;
+  if (tilde >= 0) {
+    return {
+      root: `http://${host}/${segments.slice(0, tilde + 1).join("/")}/`,
+      rule: "tilde",
+    };
+  }
 
-  // ジオシティーズ日本: /<エリア名>/<番地>/ の 2 階層でひとつのサイト。
-  // 番地（数字）を必須にする。これが無いものは /advertise/ /aboutgeo/ /addbook.html の
-  // ようなサービス側のページで、個人サイトではない。
-  if (/geocities\.co\.jp$/i.test(host)) {
-    return segments.length >= 2 && /^\d+$/.test(segments[1])
-      ? `http://${host}/${segments[0]}/${segments[1]}/`
+  // ジオシティーズ系: 番地（数字）までがひとつのサイト。
+  //   日本   /<エリア名>/<番地>/                例: /Playtown-Bingo/1234/
+  //   本家   /<Neighborhood>/<番地>/            例: /Area51/1002/
+  //   本家   /<Neighborhood>/<Suburb>/<番地>/   例: /Area51/Vault/1005/
+  // 番地を必須にするのは、これが無いものが /advertise/ /aboutgeo/ /addbook.html の
+  // ようなサービス側のページ（＝個人サイトではない）だから。
+  if (NUMBERED_ADDRESS_HOSTS.test(host)) {
+    const idx = segments.findIndex((s, i) => i < 3 && /^\d+$/.test(s));
+    return idx > 0
+      ? { root: `http://${host}/${segments.slice(0, idx + 1).join("/")}/`, rule: "numbered" }
       : null;
   }
 
@@ -361,8 +383,16 @@ export function siteRootOf(rawUrl: string): string | null {
   // ただし先頭がファイル名（index.html 等）ならホスト直下の 1 枚ページで、
   // ユーザー領域ではないので数えない。
   if (FILE_SEGMENT_RE.test(segments[0])) return null;
-  return `http://${host}/${segments[0]}/`;
+  return { root: `http://${host}/${segments[0]}/`, rule: "generic" };
 }
+
+/**
+ * 「番地」でユーザーを区切るホスト。
+ *
+ * ジオシティーズは日本版・本家・復元ミラーのいずれもこの形。本家には
+ * `www5.geocities.com` のような連番ホストがあるため、末尾一致で拾う。
+ */
+const NUMBERED_ADDRESS_HOSTS = /(^|\.)(geocities\.(co\.jp|com)|oocities\.org)$/i;
 
 /** 拡張子付きのパス片＝ディレクトリではなくファイル */
 const FILE_SEGMENT_RE = /\.(html?|shtml|cgi|php|txt|gif|jpe?g|png|zip|lzh|pdf)$/i;
@@ -431,11 +461,10 @@ export async function discoverSites(params: {
     maxRecords,
   );
 
-  const grouped = new Map<string, DiscoveredSite>();
-  for (const rec of scan.records) {
-    const root = siteRootOf(rec.original);
-    if (!root) continue;
+  const assigned = assignRoots(scan.records);
 
+  const grouped = new Map<string, DiscoveredSite>();
+  for (const { root, rec } of assigned) {
     const existing = grouped.get(root);
     if (existing) {
       existing.observedFiles++;
@@ -463,6 +492,92 @@ export async function discoverSites(params: {
     sampled: scan.sampled,
     note: scan.note,
   };
+}
+
+/**
+ * 先頭 1 階層が「ユーザー」ではなく「地区」だと判定する閾値。
+ *
+ * 実測: Angelfire の `/on/` 配下には数百人が並ぶ一方、個人サイト 1 件が持つ
+ * 直下ディレクトリは images / links / cgi-bin など数個に留まる。
+ * 低くすると大きな個人サイトが分割され、高くすると地区が 1 サイトに潰れる。
+ */
+const NEIGHBORHOOD_MIN_CHILDREN = 8;
+
+/**
+ * 各レコードをサイト根へ割り当てる。
+ *
+ * 先頭 1 階層を機械的にユーザー領域とみなすと、Angelfire の `/on/<user>/` や
+ * FortuneCity の `/<エリア>/<地区>/<番地>/` のような「中間ディレクトリを挟む」ホストで
+ * 地区がまるごと 1 サイトに潰れる（`www.angelfire.com/on/` に数百人が同居する）。
+ * 海外ホストはこの形が日本より多く、ホスト名の辞書を持っても取りこぼす。
+ *
+ * そこで規則で確定できなかった根（rule=generic）だけ、同じ根に何種類の
+ * 子ディレクトリがぶら下がったかを実データから数え、閾値を超えたものを
+ * 「地区」とみなして 1 段深く畳み直す。
+ */
+function assignRoots(records: CdxRecord[]): Array<{ root: string; rec: CdxRecord }> {
+  const assigned: Array<{ root: string; rec: CdxRecord; child?: string }> = [];
+  const childrenOf = new Map<string, Set<string>>();
+  const directFilesOf = new Map<string, number>();
+
+  for (const rec of records) {
+    const info = siteRootInfo(rec.original);
+    if (!info) continue;
+
+    const child = info.rule === "generic" ? childDirUnder(rec.original, info.root) : undefined;
+    assigned.push({ root: info.root, rec, child });
+    if (info.rule !== "generic") continue;
+
+    if (child) {
+      const set = childrenOf.get(info.root) ?? new Set<string>();
+      set.add(child);
+      childrenOf.set(info.root, set);
+    } else {
+      directFilesOf.set(info.root, (directFilesOf.get(info.root) ?? 0) + 1);
+    }
+  }
+
+  const neighborhoods = new Set(
+    [...childrenOf.entries()]
+      .filter(
+        ([root, children]) =>
+          children.size >= NEIGHBORHOOD_MIN_CHILDREN &&
+          // 個人サイトも images/ pics/ 等を持つが、その場合は根の直下に
+          // index.html・links.html… とファイルが並ぶ。地区の直下はほぼ空。
+          children.size > (directFilesOf.get(root) ?? 0),
+      )
+      .map(([root]) => root),
+  );
+
+  return assigned
+    .map(({ root, rec, child }) =>
+      neighborhoods.has(root)
+        ? child
+          ? { root: `${root}${child}/`, rec }
+          : // 地区そのものの直下にあるファイル（索引ページ等）は個人サイトではない
+            null
+        : { root, rec },
+    )
+    .filter((x): x is { root: string; rec: CdxRecord } => x !== null);
+}
+
+/**
+ * 根の 1 つ下のディレクトリ名を返す。無い（＝根の直下のファイル）なら undefined。
+ */
+function childDirUnder(rawUrl: string, root: string): string | undefined {
+  let path: string;
+  try {
+    path = new URL(normalizeUrl(rawUrl)).pathname;
+  } catch {
+    return undefined;
+  }
+  const rootPath = root.replace(/^https?:\/\/[^/]+/, "");
+  if (!path.startsWith(rootPath)) return undefined;
+
+  const rest = path.slice(rootPath.length).split("/").filter(Boolean);
+  // 残りが 1 つだけなら、それはディレクトリ名ではなくファイル名
+  if (rest.length < 2 || FILE_SEGMENT_RE.test(rest[0])) return undefined;
+  return rest[0];
 }
 
 export interface AvailabilityResult {
@@ -630,19 +745,107 @@ function fromCodePoint(n: number): string | undefined {
 }
 
 /**
+ * アクセント記号の名前付き実体参照を組み立てる。
+ *
+ * 欧州語のページは `&eacute;` `&uuml;` `&ccedil;` を多用し、当時のエディタは
+ * 文字を直接書かずこの形で吐くものが多かった。1 件ずつ表に書くと 60 行を超えるので、
+ * 「基底文字 ＋ 結合記号」を NFC 正規化して生成する。
+ */
+function buildAccentEntities(): Record<string, string> {
+  const marks: Record<string, string> = {
+    grave: "̀",
+    acute: "́",
+    circ: "̂",
+    tilde: "̃",
+    uml: "̈",
+    ring: "̊",
+    cedil: "̧",
+  };
+  const table: Record<string, string> = {};
+  for (const [name, mark] of Object.entries(marks)) {
+    for (const letter of "aeiouyncAEIOUYNC") {
+      const composed = (letter + mark).normalize("NFC");
+      // 合成できた組み合わせだけ採る（&ecedil; のような実在しない綴りを作らない）
+      if (composed.length === 1) table[`${letter}${name}`] = composed;
+    }
+  }
+  return table;
+}
+
+/**
+ * 名前付き実体参照。数値参照と違い綴りを知らないと戻せない。
+ *
+ * 未対応のまま放置すると、フランス語・ドイツ語圏の古いページが
+ * "la page demand&eacute;e" のまま本文に出てきて読めない（実測: perso.wanadoo.fr）。
+ */
+const NAMED_ENTITIES: Record<string, string> = {
+  ...buildAccentEntities(),
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+  szlig: "ß",
+  aelig: "æ",
+  AElig: "Æ",
+  oslash: "ø",
+  Oslash: "Ø",
+  eth: "ð",
+  thorn: "þ",
+  copy: "©",
+  reg: "®",
+  trade: "™",
+  deg: "°",
+  plusmn: "±",
+  times: "×",
+  divide: "÷",
+  frac12: "½",
+  frac14: "¼",
+  sup2: "²",
+  sup3: "³",
+  micro: "µ",
+  para: "¶",
+  sect: "§",
+  middot: "·",
+  laquo: "«",
+  raquo: "»",
+  iquest: "¿",
+  iexcl: "¡",
+  pound: "£",
+  yen: "¥",
+  euro: "€",
+  cent: "¢",
+  curren: "¤",
+  ndash: "–",
+  mdash: "—",
+  lsquo: "'",
+  rsquo: "'",
+  ldquo: "“",
+  rdquo: "”",
+  bull: "•",
+  hellip: "…",
+  dagger: "†",
+  permil: "‰",
+  ordf: "ª",
+  ordm: "º",
+  shy: "",
+};
+
+/**
  * 実体参照を戻す。
  *
  * &amp; は最後に処理する（先に解くと &amp;#169; が © になってしまうため）。
- * 当時のページは記号を &#169; のような数値文字参照で書くことがあり、
+ * 当時のページは記号を &#169; や &eacute; のように参照で書くことがあり、
  * 未処理のままだと本文テキストやリンクテキストにそのまま露出する。
  */
 function decodeEntities(text: string): string {
   return text
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&nbsp;/g, " ")
+    .replace(/&([a-z][a-z0-9]{1,7});/gi, (m, name: string) => {
+      // 綴りは大小が意味を持つ（&Eacute; と &eacute;）ので完全一致を優先し、
+      // &QUOT; のような全大文字表記だけ小文字へ丸めて拾う
+      const hit = NAMED_ENTITIES[name] ?? NAMED_ENTITIES[name.toLowerCase()];
+      return hit ?? m;
+    })
     .replace(/&#(\d{1,7});/g, (m, d) => fromCodePoint(Number(d)) ?? m)
     .replace(/&#x([0-9a-f]{1,6});/gi, (m, h) => fromCodePoint(parseInt(h, 16)) ?? m)
     .replace(/&amp;/g, "&");

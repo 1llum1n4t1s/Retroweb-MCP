@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 /**
- * Retroweb MCP — 90 年代〜2000 年代前半の日本語個人サイトを Web アーカイブから発掘する MCP サーバ。
+ * Retroweb MCP — 90 年代〜2000 年代前半の個人サイトを Web アーカイブから発掘する MCP サーバ。
+ * 日本語圏と海外（英語圏・欧州・豪州）の双方を対象にする。
  *
  * 設計方針:
  *   現行検索エンジンのインデックスから消えた領域が対象なので「全文検索」は成立しない。
  *   代わりに (1) アーカイブ内の URL 空間を列挙し (2) 保存済みページのリンクを辿る、
  *   という当時の発見経路（ディレクトリとリンク集）を再現することで到達する。
+ *   唯一の例外が Wiby で、今も生きている旧式ページに限れば全文検索が使える（英語のみ）。
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -22,12 +24,15 @@ import {
 } from "./wayback.js";
 import { buildMarginaliaQuery } from "./marginalia.js";
 import { buildWarpQuery } from "./warp.js";
+import { wibySearch } from "./wiby.js";
 import {
-  COMMERCIAL_NOISE_DOMAINS,
   LEGACY_HOSTS,
-  PERIOD_PHRASES,
   buildPhraseQueries,
   buildSiteQueries,
+  matchesRegion,
+  noiseDomainsFor,
+  periodPhrases,
+  phraseLangFor,
 } from "./legacy-domains.js";
 
 const server = new McpServer({
@@ -51,6 +56,24 @@ function fail(message: string) {
   };
 }
 
+/**
+ * 地域指定。日本語圏と海外でホストも言い回しも別物なので、全ツールで同じ語彙を使う。
+ * 'intl' は日本以外すべて、'global' は国を跨いだサービス（WebRing・DMOZ 等）だけを指す。
+ */
+const REGION_ENUM = [
+  "jp",
+  "intl",
+  "us",
+  "uk",
+  "fr",
+  "de",
+  "it",
+  "nl",
+  "au",
+  "global",
+  "all",
+] as const;
+
 /** 例外を利用者向けメッセージへ落とす共通ラッパ */
 async function guard<T>(fn: () => Promise<T>) {
   try {
@@ -70,7 +93,7 @@ server.registerTool(
     description:
       "Internet Archive の CDX API で、あるドメインやパス配下に保存されている URL を年代指定で列挙する。" +
       "90年代・昔のサイト・消えたページ・閉鎖したホームページ・ジオシティーズなど、" +
-      "Google のインデックスから消えた古い個人サイトを探す際の起点となるツール。" +
+      "Google のインデックスから消えた古い個人サイトを探す際の起点となるツール。日本語圏・海外の双方に使える。" +
       "全文検索ではなくドメイン単位の列挙である点に注意（内容から探すことはできない）。",
     inputSchema: {
       url: z
@@ -117,11 +140,13 @@ server.registerTool(
 server.registerTool(
   "discover_sites",
   {
-    title: "個人サイトの一覧を発掘",
+    title: "個人サイトの一覧を発掘（日本語圏・海外）",
     description:
       "あるホストやエリア配下に『どんな個人サイトが存在したか』を列挙する。" +
-      "ジオシティーズのエリア（例 www.geocities.co.jp/Playtown-Bingo）やプロバイダのユーザー領域を指定すると、" +
-      "ユーザーごとのサイト単位に畳んで一覧化する。" +
+      "ジオシティーズのエリア（日本 www.geocities.co.jp/Playtown-Bingo、本家 www.geocities.com/Area51）や" +
+      "プロバイダのユーザー領域を指定すると、ユーザーごとのサイト単位に畳んで一覧化する。" +
+      "日本版の /<エリア>/<番地>/、本家の /<Neighborhood>/<Suburb>/<番地>/、チルダ形式 /~user/、" +
+      "Angelfire のような /<地区コード>/<ユーザー>/ をいずれも正しく畳む。" +
       "wayback_cdx_search はファイル単位で返るため 1 サイトの画像群に埋もれてしまうが、" +
       "こちらはページを跨いで収集しサイト単位にまとめるため、無名サイトの発見にはこちらを使う。" +
       "検索エンジンに一切載っていない 90年代の個人ホームページを見つける主力ツール。",
@@ -129,8 +154,9 @@ server.registerTool(
       url: z
         .string()
         .describe(
-          "ホストまたはエリアの prefix。例: 'www.geocities.co.jp/Playtown-Bingo' 'homepage1.nifty.com'。" +
-            "'www.geocities.co.jp' のようにホスト名だけでも可（索引全体から散らして標本抽出する）",
+          "ホストまたはエリアの prefix。例: 'www.geocities.co.jp/Playtown-Bingo' 'homepage1.nifty.com' " +
+            "'www.geocities.com/Area51' 'www.angelfire.com' 'members.aol.com'。" +
+            "ホスト名だけでも可（索引全体から散らして標本抽出する）",
         ),
       from: z.string().optional().describe("開始年。例 '1998'"),
       to: z.string().optional().describe("終了年。例 '2002'"),
@@ -295,40 +321,72 @@ server.registerTool(
 server.registerTool(
   "legacy_hosts",
   {
-    title: "90年代日本語サイトのホスト辞書",
+    title: "90年代サイトのホスト辞書（日本語圏・海外）",
     description:
-      "90年代〜2000年代前半の日本語個人サイトが置かれていた無料ホームページサービス・" +
-      "プロバイダスペース・ランキングサイトの一覧を返す。ジオシティーズ、@nifty、BIGLOBE、" +
-      "ベッコアメ、Infoseek isweb など。CDX 探索の起点選びや site: 絞り込みに使う。",
+      "90年代〜2000年代前半の個人サイトが置かれていた無料ホームページサービス・" +
+      "プロバイダスペース・ディレクトリの一覧を返す。" +
+      "日本語圏はジオシティーズ、@nifty、BIGLOBE、ベッコアメ、Infoseek isweb など。" +
+      "海外は GeoCities 本家、Angelfire、Tripod、Xoom、AOL、FortuneCity、" +
+      "英 Demon、独 T-Online、仏 Multimania／Wanadoo、DMOZ など。" +
+      "CDX 探索の起点選びや site: 絞り込みに使う。海外を探すなら region='intl' を指定する。",
     inputSchema: {
       category: z
         .enum(["free-hosting", "isp-space", "university", "community"])
         .optional()
         .describe("種別で絞る。community は発見の入口（ランキング・ディレクトリ・リング）"),
+      region: z
+        .enum(REGION_ENUM)
+        .optional()
+        .describe(
+          "地域で絞る。'jp'=日本語圏（既定は全件）, 'intl'=海外すべて, " +
+            "'us'/'uk'/'fr'/'de'/'it'/'nl'/'au'=国別, 'global'=国を跨ぐサービス",
+        ),
     },
   },
-  async ({ category }) =>
+  async ({ category, region }) =>
     guard(async () => {
-      const hosts = category
-        ? LEGACY_HOSTS.filter((h) => h.category === category)
-        : LEGACY_HOSTS;
-      return { count: hosts.length, hosts };
+      const hosts = LEGACY_HOSTS.filter(
+        (h) =>
+          (!category || h.category === category) &&
+          (!region || matchesRegion(h, region)),
+      );
+      return {
+        count: hosts.length,
+        hint:
+          "userPathHint はユーザー領域のパス形で、discover_sites に渡す prefix の組み立てに使う。" +
+          "searchIndex='modern' のホストは現行検索では現代のページしか返らないので CDX 側の起点として使う。",
+        hosts,
+      };
     }),
 );
 
 server.registerTool(
   "build_retro_queries",
   {
-    title: "レトロサイト向け検索クエリ生成",
+    title: "レトロサイト向け検索クエリ生成（日本語圏・海外）",
     description:
       "現行の検索エンジン（Google / Bing 等）に投げるための、当時のホストを site: で絞り込んだ" +
-      "クエリ群と、90年代特有の言い回し（リンクフリー、キリ番、相互リンク募集、工事中 など）を" +
-      "組み合わせた検索語を生成する。素のキーワードより命中率が上がる。" +
+      "クエリ群と、当時特有の言い回しを組み合わせた検索語を生成する。素のキーワードより命中率が上がる。" +
+      "日本語圏は「リンクフリー」「キリ番」「相互リンク募集」「工事中」、" +
+      "海外は \"Under Construction\" \"Sign my guestbook\" \"You are visitor number\" " +
+      "\"Best viewed with Netscape\" などを使う（訳語では当たらないため個別に持っている）。" +
       "サービス終了済みのホストだけを対象にし、現行のショッピングサイトを除外する句を付けるため、" +
-      "Yahoo!ショッピングや Amazon の商品ページに流れない。" +
+      "Yahoo!ショッピングや Amazon・eBay の商品ページに流れない。" +
+      "海外を探すときは region='intl' を指定する（言い回しも自動で英語になる）。" +
       "生成されたクエリは WebSearch ツールへそのまま渡して使う。",
     inputSchema: {
-      keyword: z.string().describe("探したい主題。例: '東方 CG 集' '個人 日記'"),
+      keyword: z
+        .string()
+        .describe(
+          "探したい主題。例: '東方 CG 集' '個人 日記' 'amiga demoscene' 'star trek fan fiction'",
+        ),
+      region: z
+        .enum(REGION_ENUM)
+        .optional()
+        .describe(
+          "対象地域（既定 'jp'）。'intl'=海外すべて, 'us'/'uk'/'fr'/'de'/'it'/'nl'/'au'=国別, 'all'=日本＋海外。" +
+            "言い回しの言語と除外する商業ドメインもこれに従う",
+        ),
       categories: z
         .array(z.enum(["free-hosting", "isp-space", "university", "community"]))
         .optional()
@@ -341,35 +399,78 @@ server.registerTool(
         .boolean()
         .optional()
         .describe(
-          "事業サイトが現役のドメイン（@nifty、OCN、ac.jp 等）も site: に含める（既定 false）。" +
-            "true にするとヒットの大半が現代のページになる",
+          "事業サイトが現役のドメイン（@nifty、OCN、ac.jp、btinternet.com、t-online.de 等）も" +
+            "site: に含める（既定 false）。true にするとヒットの大半が現代のページになる",
         ),
     },
   },
-  async ({ keyword, categories, includePeriodPhrases = true, includeModernHosts = false }) =>
+  async ({
+    keyword,
+    categories,
+    region = "jp",
+    includePeriodPhrases = true,
+    includeModernHosts = false,
+  }) =>
     guard(async () => {
+      const lang = phraseLangFor(region);
       const siteQueries = buildSiteQueries(keyword, categories, {
         includeModernHosts,
+        region,
       });
       const phraseQueries = includePeriodPhrases
-        ? buildPhraseQueries(keyword)
+        ? buildPhraseQueries(keyword, { lang, region })
         : [];
       return {
+        region,
+        phraseLang: lang,
         siteQueries,
         phraseQueries,
-        excludedDomains: COMMERCIAL_NOISE_DOMAINS,
-        periodPhrases: PERIOD_PHRASES,
+        excludedDomains: noiseDomainsFor(region),
+        periodPhrases: periodPhrases(lang),
         hint:
           "siteQueries は 1 本ずつ WebSearch に投げること（OR を繋げすぎると検索側に無視されます）。" +
           "ヒットしたらその URL を wayback_cdx_search と wayback_outlinks に渡して掘り下げます。" +
           "なお当時のホストは現行検索の索引からほぼ消えているため、この経路の期待値は低いです。" +
-          "実際に届くのは discover_sites → wayback_outlinks の芋づるなので、そちらを主軸にしてください。",
+          "実際に届くのは discover_sites → wayback_outlinks の芋づるなので、そちらを主軸にしてください。" +
+          (region === "jp"
+            ? ""
+            : " 海外の主題なら wiby_search（旧式ページ専門の全文検索）も併用してください。こちらは実際にヒットします。"),
       };
     }),
 );
 
 // ---------------------------------------------------------------------------
-// 6. Marginalia（英語圏の retro web 資料向け）
+// 6. Wiby — 海外の古いサイトに対してだけ成立する全文検索
+// ---------------------------------------------------------------------------
+server.registerTool(
+  "wiby_search",
+  {
+    title: "Wiby 全文検索（旧式ページ専門の検索エンジン）",
+    description:
+      "昔ながらの手打ちページだけを人手で選んで索引している検索エンジン Wiby を全文検索する。" +
+      "現代の商業ページを構造的に含まないため、90年代〜2000年代前半の雰囲気を持つ" +
+      "海外の個人サイトを『内容から』探せる。本サーバで唯一、全文検索が成立する経路。" +
+      "【重要】索引対象は今も生きている旧式ページであり、アーカイブではない。" +
+      "消えたサイトを探すなら wayback_* と併用する。日本語の索引はほぼ無いので英語で叩くこと。" +
+      "1 回 12 件が上限でページングできない（続きが要るなら語を変えて呼び直す）。",
+    inputSchema: {
+      query: z
+        .string()
+        .describe("検索語（英語）。例: 'amiga demoscene' 'homemade rocketry' 'star trek fan page'"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(12)
+        .optional()
+        .describe("返す件数（既定 12 = サーバ側の上限）"),
+    },
+  },
+  async ({ query, limit }) => guard(() => wibySearch(query, limit)),
+);
+
+// ---------------------------------------------------------------------------
+// 7. Marginalia（海外の非商業サイト向け。URL 生成のみ）
 // ---------------------------------------------------------------------------
 server.registerTool(
   "marginalia_search_url",
@@ -377,8 +478,10 @@ server.registerTool(
     title: "Marginalia 検索 URL 生成（独立系・非商業サイト優遇）",
     description:
       "商業性の低い個人サイトや古いページを優遇する独立系検索エンジン Marginalia の検索 URL を組み立てる。" +
-      "【制約】Marginalia は公式に英語専用で、日本語クエリでは結果が返らない。" +
+      "海外（英語圏）の古い個人サイトを内容から探す用途に向く。" +
+      "【制約】公式に英語専用で、日本語クエリでは結果が返らない。" +
       "またサービス移行中で HTML 構造が不安定なため、結果の自動取得は行わずブラウザでの閲覧を前提とする。" +
+      "自動で結果まで欲しいときは wiby_search を使う（こちらは JSON API があり実際に取得できる）。" +
       "日本語の古いサイト本体を探す用途には使えない（wayback_* ツールを使うこと）。",
     inputSchema: {
       query: z.string().describe("検索語（英語のみ有効）"),
@@ -388,7 +491,7 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// 7. NDL WARP（URL 生成のみ）
+// 8. NDL WARP（日本語サイト向け。URL 生成のみ）
 // ---------------------------------------------------------------------------
 server.registerTool(
   "warp_search_url",
@@ -417,31 +520,101 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// 8. 探索戦略ガイド — /drdr など、ツールだけ見て手順が分からない呼び出し元向け
+// 9. 探索戦略ガイド — /drdr など、ツールだけ見て手順が分からない呼び出し元向け
 // ---------------------------------------------------------------------------
+
+/** 海外を探すときだけ差し込む手順。日本語圏との違いが大きい箇所に絞る。 */
+const INTL_STEPS = [
+  {
+    step: "海外 1",
+    action: "まず全文検索で当たりを取る（海外だけの特権）",
+    tool: "wiby_search",
+    detail:
+      "Wiby は旧式の手打ちページだけを索引しているので、主題を英語 1〜2 語で叩くと" +
+      "当時の空気のサイトが直接返る。日本語圏には同等の索引が存在しない。" +
+      "ヒットしたサイトの URL をそのまま wayback_outlinks へ渡して芋づるに接続する。",
+  },
+  {
+    step: "海外 2",
+    action: "GeoCities 本家のエリアを列挙する",
+    tool: "discover_sites",
+    detail:
+      "例: url='www.geocities.com/Area51', from='1997', to='2001'。" +
+      "本家は /<Neighborhood>/<番地>/ に加えて /<Neighborhood>/<Suburb>/<番地>/ の 3 階層がある" +
+      "（実測: /Area51/Vault/1005/）。エリアは主題に対応していて、" +
+      "Area51=SF・ゲーム, SoHo=アート, Athens=学術, Hollywood=映画, Heartland=家庭, " +
+      "SiliconValley=技術, Tokyo=アジア文化, Paris=仏語, Vienna=クラシック音楽。" +
+      "Angelfire は /<コード>/<ユーザー>/ の中間ディレクトリがあるが、discover_sites が" +
+      "実データから判定して畳むのでホスト名だけ渡してよい。",
+  },
+  {
+    step: "海外 3",
+    action: "DMOZ / Yahoo! Directory 本家のカテゴリページを起点にする",
+    tool: "wayback_cdx_search → wayback_outlinks",
+    detail:
+      "例: url='dmoz.org/Recreation', from='1999', to='2003'。" +
+      "DMOZ（2017 終了）は海外版の dir.yahoo.co.jp に当たる最大の人力名簿で、" +
+      "カテゴリページ 1 枚から個人サイトの URL がまとめて取れる。" +
+      "dir.yahoo.com（2014 終了）の 1996〜2000 年スナップショットも同様に効く。",
+  },
+  {
+    step: "海外 4",
+    action: "Web リングのハブから参加サイト一覧を取る",
+    tool: "wayback_outlinks",
+    detail:
+      "www.webring.org / www.ringsurf.com / www.bomis.com のリング一覧ページは、" +
+      "同じ主題の個人サイトが数十件ずつ並ぶ。日本語圏の webring.ne.jp と同じ使い方。",
+  },
+  {
+    step: "海外 5",
+    action: "国別の ISP スペースへ降りる",
+    tool: "legacy_hosts(region='uk'|'fr'|'de'|…) → discover_sites",
+    detail:
+      "欧州は ISP の寡占が強く、英=homepages.demon.co.uk / freespace.virgin.net、" +
+      "独=home.t-online.de、仏=perso.wanadoo.fr / www.multimania.com / www.chez.com、" +
+      "伊=digilander.iol.it、蘭=www.xs4all.nl/~。米国は members.aol.com と " +
+      "ourworld.compuserve.com の比重が大きい。",
+  },
+];
+
 server.registerTool(
   "retro_search_strategy",
   {
     title: "レトロサイト発掘の探索手順",
     description:
-      "90年代の日本語個人サイトなど、検索エンジンに載っていない古いマイナーサイトを探すための" +
-      "手順書を返す。どのツールをどの順で使うか迷ったとき、最初にこれを呼ぶ。",
+      "90年代の個人サイトなど、検索エンジンに載っていない古いマイナーサイトを探すための" +
+      "手順書を返す。日本語圏と海外の双方に対応する。" +
+      "どのツールをどの順で使うか迷ったとき、最初にこれを呼ぶ。",
     inputSchema: {
       topic: z.string().optional().describe("探したい主題（あれば手順を具体化する）"),
+      region: z
+        .enum(REGION_ENUM)
+        .optional()
+        .describe(
+          "対象地域（既定 'jp'）。'intl' や国別を指定すると海外向けの手順・ホスト・言い回しに切り替わる",
+        ),
     },
   },
-  async ({ topic }) =>
+  async ({ topic, region = "jp" }) =>
     guard(async () => ({
+      region,
       principle:
         "90年代の個人サイトは『検索』ではなく『ディレクトリとリンク集とWebリング』で発見される設計だった。" +
-        "したがって現代の全文検索を強化するのではなく、当時の発見経路をアーカイブ上で再生するのが唯一確実な方法。",
+        "したがって現代の全文検索を強化するのではなく、当時の発見経路をアーカイブ上で再生するのが唯一確実な方法。" +
+        "これは日本語圏でも海外でも変わらない。違うのはホスト名・URL の階層・当時の言い回しで、" +
+        "海外にだけ全文検索の抜け道（wiby_search）がある。",
+      // 海外指定のときは、日本語圏と手順が異なる部分を先に置く
       steps: [
+        ...(region === "jp" ? [] : INTL_STEPS),
         {
           step: 1,
           action: "起点となるホストを決める",
-          tool: "legacy_hosts",
+          tool: `legacy_hosts(region='${region}')`,
           detail:
-            "主題に合う無料ホスティング／プロバイダを選ぶ。入口が欲しいなら category='community'（Yahoo!ディレクトリ、ReadMe!、日記才人、WebRing）。",
+            "主題に合う無料ホスティング／プロバイダを選ぶ。入口が欲しいなら category='community'" +
+            "（日本語圏なら Yahoo!ディレクトリ・ReadMe!・日記才人・WebRing Japan、" +
+            "海外なら DMOZ・dir.yahoo.com・WebRing・RingSurf）。" +
+            "region を指定しないと日本語圏と海外が混ざって返る。",
         },
         {
           step: 2,
@@ -489,7 +662,17 @@ server.registerTool(
         },
       ],
       pitfalls: [
-        "Wayback の CDX は全文検索ではない。ページ内容からは探せないので、必ずドメインか URL 断片を先に手に入れる。",
+        "Wayback の CDX は全文検索ではない。ページ内容からは探せないので、必ずドメインか URL 断片を先に手に入れる。" +
+          "例外は wiby_search だけで、これは海外の生きている旧式ページに限られる。",
+        "GeoCities は日本版と本家で URL の階層が違う。日本 /<エリア>/<番地>/ に対し、" +
+          "本家は /<Neighborhood>/<Suburb>/<番地>/ の 3 階層がある。discover_sites は両方畳めるが、" +
+          "prefix を手で組むときは Suburb の有無で結果が変わる。",
+        "海外ホストは Angelfire の /<コード>/<ユーザー>/ のように、先頭 1 階層が『ユーザー』ではなく" +
+          "『地区』のことがある。discover_sites は子ディレクトリの多さから地区を判定して 1 段深く畳むが、" +
+          "サイト数が極端に少ない標本ではこの判定が働かないことがある（maxRecords を上げる）。",
+        "海外の言い回しは訳語では当たらない。「工事中」→\"Under Construction\"、" +
+          "「キリ番」→\"You are visitor number\"、「足跡帳」→\"Sign my guestbook\" のように定型文ごと違う。" +
+          "build_retro_queries に region を渡すと自動で切り替わる。",
         "現行検索エンジンで当時のホストを site: 指定しても、索引から消えているためほぼ 0 件になる。" +
           "検索側はヒットが乏しいと絞り込みを緩めるので、放っておくと生きているショッピングサイトが返る" +
           "（実測: site:geocities.co.jp → Yahoo!ショッピング）。build_retro_queries が除外句を付けるが、" +
@@ -497,13 +680,17 @@ server.registerTool(
         "discover_sites にホスト名だけを渡した結果は網羅ではなく標本（coverage.sampled=true）。" +
           "出てきたエリア名で呼び直すと、そのエリアは網羅に近づく。",
         "WARP は 2002 年以降の収集で、90年代はほぼ入っていない。90年代狙いなら Wayback 一択。",
-        "Marginalia は日本語索引が弱く、日本語クエリはほぼ 0 件。",
+        "Marginalia も Wiby も英語専用で、日本語クエリはほぼ 0 件。日本語圏では使わない。",
         "アーカイブに残っていても robots 除外やサーバ消滅で本文が取れないことがある。複数の年代のスナップショットを試す。",
         "文字コードは Shift_JIS / EUC-JP が主流。文字化けしたら raw=true で生 HTML を見て meta charset を確認する。",
       ],
       topicSpecific: topic
-        ? `主題「${topic}」については、まず build_retro_queries で site: クエリを生成して当たりを付け、` +
-          `ヒットした 1 サイトの URL を wayback_outlinks に入れて周辺サイトへ広げるのが速い。`
+        ? region === "jp"
+          ? `主題「${topic}」については、まず build_retro_queries で site: クエリを生成して当たりを付け、` +
+            `ヒットした 1 サイトの URL を wayback_outlinks に入れて周辺サイトへ広げるのが速い。`
+          : `主題「${topic}」については、まず wiby_search に英語 1〜2 語で投げて生きている旧式サイトを掴み、` +
+            `その URL を wayback_outlinks に入れて当時のリンク集へ遡るのが速い。` +
+            `並行して discover_sites に www.geocities.com の主題に合うエリアを渡す。`
         : undefined,
     })),
 );

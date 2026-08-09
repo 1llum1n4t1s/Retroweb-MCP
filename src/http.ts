@@ -173,7 +173,7 @@ export function decodeHtml(buffer: ArrayBuffer, headerCharset?: string): string 
   }
 
   // 3. 指定が無ければバイト分布から推定
-  if (!charset) charset = detectJapaneseCharset(bytes);
+  if (!charset) charset = detectCharset(bytes);
 
   try {
     return new TextDecoder(charset, { fatal: false }).decode(bytes);
@@ -219,10 +219,20 @@ function normalizeCharset(value: string | undefined | null): string | undefined 
 }
 
 /**
- * Shift_JIS / EUC-JP / UTF-8 をバイト列から推定する。
+ * 高位バイトの比率がこの値を下回るなら、日本語ではなく西欧語のページとみなす。
+ *
+ * 日本語ページは本文が丸ごと多バイトなので高位バイトが全体の 1〜3 割を占める。
+ * 対してフランス語・ドイツ語のページはアクセント記号が散在するだけで 1% に満たない。
+ * この差を見ないと、Latin-1 の「ü」(0xFC) や「é」(0xE9) が Shift_JIS の 2 バイト目を
+ * 拾って化ける（実測: 2001 年の home.t-online.de が "führt" を化けさせた）。
+ */
+const WESTERN_HIGH_BYTE_RATIO = 0.01;
+
+/**
+ * Shift_JIS / EUC-JP / UTF-8 / windows-1252 をバイト列から推定する。
  * それぞれの符号化で「妥当な多バイト列」がいくつ現れるかを数えて多数決する。
  */
-function detectJapaneseCharset(bytes: Uint8Array): string {
+function detectCharset(bytes: Uint8Array): string {
   // ISO-2022-JP はエスケープシーケンスで一意に判別できる
   for (let i = 0; i + 2 < bytes.length; i++) {
     if (bytes[i] === 0x1b && bytes[i + 1] === 0x24 &&
@@ -263,12 +273,24 @@ function detectJapaneseCharset(bytes: Uint8Array): string {
     else if (b >= 0xa1 && b <= 0xdf) sjis += 1;
   }
 
-  // 非 ASCII がほぼ無いなら UTF-8 扱いで問題ない
-  if (highBytes < 4) return "utf-8";
+  // 完全な ASCII なら UTF-8 扱いで問題ない。
+  // 「ほぼ ASCII」を UTF-8 に倒してはいけない: ウムラウトが数個だけの西欧語ページは
+  // その数個が単独の高位バイトなので、UTF-8 として読むと U+FFFD になる
+  // （実測: 2001 年の home.t-online.de は 1139 バイト中 3 バイトだけが 0xFC / 0xF6）。
+  if (highBytes === 0) return "utf-8";
 
-  // 0x81-0x9F は EUC-JP には出現しないので、これが多ければ Shift_JIS 濃厚
-  if (sjis > euc && sjis >= utf8) return "shift_jis";
-  if (euc > sjis && euc >= utf8) return "euc-jp";
+  // 高位バイトのほぼ全てが妥当な UTF-8 列なら UTF-8。
+  // ここで先に確定させないと、UTF-8 の「é」(0xC3 0xA9) が EUC-JP の 2 バイト範囲に
+  // 収まるため、アクセントの多い欧州語ページが EUC-JP と誤判定される。
+  if (utf8 >= highBytes * 0.9) return "utf-8";
+
+  // 日本語の符号化なら本文が多バイトなので高位バイトが密に出る。疎なら西欧語。
+  if (highBytes / bytes.length < WESTERN_HIGH_BYTE_RATIO) return "windows-1252";
+
+  // 0x81-0x9F は EUC-JP には出現しないので、これが多ければ Shift_JIS 濃厚。
+  // 同点は UTF-8 に倒す（誤って多バイト解釈すると本文全体が壊れるため）。
+  if (sjis > euc && sjis > utf8) return "shift_jis";
+  if (euc > sjis && euc > utf8) return "euc-jp";
   return "utf-8";
 }
 

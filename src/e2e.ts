@@ -57,6 +57,7 @@ await check("tools/list", async () => {
     "wayback_outlinks",
     "legacy_hosts",
     "build_retro_queries",
+    "wiby_search",
     "marginalia_search_url",
     "warp_search_url",
     "retro_search_strategy",
@@ -165,6 +166,48 @@ await check("実地: リンク集からの芋づる（別ホストへ到達で�
   });
   if (links.count === 0) throw new Error("リンク 0 件");
   return `${links.count} リンク / ${links.distinctHosts} ホスト / 例: ${links.hosts.slice(0, 4).join(", ")}`;
+});
+
+// --- 海外の発掘が通しで成立するか ---
+await check("海外: 手順・ホスト辞書が地域で切り替わること", async () => {
+  const strategy = await call("retro_search_strategy", {
+    topic: "amiga demoscene",
+    region: "intl",
+  });
+  const tools = (strategy.steps as { tool: string }[]).map((s) => s.tool).join(" ");
+  if (!tools.includes("wiby_search")) throw new Error("海外手順に wiby_search が出てこない");
+
+  const hosts = await call("legacy_hosts", { region: "intl" });
+  if (hosts.count === 0) throw new Error("海外ホストが 0 件");
+  const jpLeak = (hosts.hosts as { region: string }[]).filter((h) => h.region === "jp");
+  if (jpLeak.length > 0) throw new Error(`region='intl' に日本のホストが混入: ${jpLeak.length} 件`);
+
+  const q = await call("build_retro_queries", { keyword: "fan page", region: "intl" });
+  if (q.phraseLang !== "en") throw new Error(`言い回しが英語になっていない: ${q.phraseLang}`);
+  return `手順 ${strategy.steps.length} ステップ / 海外ホスト ${hosts.count} 件 / 英語クエリ ${q.siteQueries.length}+${q.phraseQueries.length} 本`;
+});
+
+await check("実地: 海外の無名個人サイトを列挙できるか", async () => {
+  const r = await call("discover_sites", {
+    url: "www.geocities.com/SoHo",
+    from: "1997",
+    to: "2001",
+    maxRecords: 1500,
+    limit: 10,
+  });
+  if (r.totalSites === 0) throw new Error("0 サイト");
+  const sites = r.sites as { siteRoot: string; observedFiles: number }[];
+  const users = sites.filter((s) => /\/SoHo(\/[^/]+)?\/\d+\/$/i.test(s.siteRoot));
+  if (users.length === 0) {
+    throw new Error(`番地まで畳めていない: ${sites.slice(0, 3).map((s) => s.siteRoot).join(", ")}`);
+  }
+  return `${r.totalSites} サイト / 例: ${users.slice(0, 3).map((s) => `${s.siteRoot}(${s.observedFiles}files)`).join(", ")}`;
+});
+
+await check("実地: 海外の旧式ページを全文検索して芋づるへ繋げるか", async () => {
+  const hit = await call("wiby_search", { query: "amiga demoscene", limit: 5 });
+  if (hit.count === 0) throw new Error("0 件");
+  return `${hit.count} 件 / 先頭: ${hit.results[0].title.slice(0, 40)} → ${hit.results[0].url}`;
 });
 
 await check("エラー処理: 存在しないドメインで例外にならないこと", async () => {

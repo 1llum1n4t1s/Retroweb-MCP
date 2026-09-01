@@ -14,6 +14,10 @@ const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 /** Retry-After に従う場合の 1 回あたり上限。極端な指示で MCP 呼び出しを止めないため */
 const MAX_RETRY_WAIT_MS = 30_000;
 
+/** API 応答とアーカイブ HTML を全量メモリ化する前に止める既定上限。 */
+const DEFAULT_TEXT_MAX_BYTES = 10 * 1024 * 1024;
+const DEFAULT_HTML_MAX_BYTES = 5 * 1024 * 1024;
+
 export interface FetchOptions {
   /** タイムアウト（ミリ秒） */
   timeoutMs?: number;
@@ -21,6 +25,8 @@ export interface FetchOptions {
   retries?: number;
   /** 追加ヘッダ */
   headers?: Record<string, string>;
+  /** 応答ボディの最大バイト数 */
+  maxBytes?: number;
 }
 
 export class HttpError extends Error {
@@ -31,6 +37,16 @@ export class HttpError extends Error {
   ) {
     super(message);
     this.name = "HttpError";
+  }
+}
+
+class ResponseTooLargeError extends Error {
+  constructor(
+    readonly url: string,
+    readonly maxBytes: number,
+  ) {
+    super(`応答がサイズ上限 ${maxBytes} バイトを超えました: ${url}`);
+    this.name = "ResponseTooLargeError";
   }
 }
 
@@ -97,6 +113,55 @@ async function discardBody(res: Response): Promise<void> {
   }
 }
 
+/** Content-Length の有無にかかわらず、上限までだけ応答を読み取る。 */
+async function readResponseBytes(
+  res: Response,
+  url: string,
+  maxBytes: number,
+): Promise<Uint8Array> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new RangeError(`maxBytes は 1 以上の整数で指定してください: ${maxBytes}`);
+  }
+
+  const declaredLength = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    await discardBody(res);
+    throw new ResponseTooLargeError(url, maxBytes);
+  }
+
+  if (!res.body) return new Uint8Array();
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          /* 既に閉じている場合は元のサイズ超過を優先する */
+        }
+        throw new ResponseTooLargeError(url, maxBytes);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
 /**
  * テキストを取得する。リトライ可能なステータスと通信エラーは指数バックオフで再試行し、
  * それでも駄目なら HttpError を投げる（呼び出し側が理由を利用者へ返せるようにするため）。
@@ -105,7 +170,12 @@ export async function fetchText(
   url: string,
   options: FetchOptions = {},
 ): Promise<string> {
-  const { timeoutMs = 30_000, retries = 3, headers = {} } = options;
+  const {
+    timeoutMs = 30_000,
+    retries = 3,
+    headers = {},
+    maxBytes = DEFAULT_TEXT_MAX_BYTES,
+  } = options;
   let lastError: Error | undefined;
   let waitHintMs = 0;
 
@@ -138,9 +208,9 @@ export async function fetchText(
         await discardBody(res);
         throw new HttpError(res.status, url, `${res.status} ${res.statusText}`);
       }
-      return await res.text();
+      return new TextDecoder("utf-8").decode(await readResponseBytes(res, url, maxBytes));
     } catch (err) {
-      if (err instanceof HttpError) throw err;
+      if (err instanceof HttpError || err instanceof ResponseTooLargeError) throw err;
       lastError = describeFetchError(err, url, timeoutMs);
     } finally {
       clearTimeout(timer);
@@ -157,7 +227,7 @@ export async function fetchText(
  * charset メタタグを持たないものも多い（実測: 1997 年の Yahoo! JAPAN トップは meta 無し）。
  * res.text() は UTF-8 決め打ちのため、そのままでは本文が全て文字化けする。
  */
-export function decodeHtml(buffer: ArrayBuffer, headerCharset?: string): string {
+export function decodeHtml(buffer: ArrayBufferLike, headerCharset?: string): string {
   const bytes = new Uint8Array(buffer);
 
   // 1. HTTP ヘッダの charset を最優先
@@ -210,6 +280,14 @@ function normalizeCharset(value: string | undefined | null): string | undefined 
   };
   const hit = map[v];
   if (hit) return hit;
+  // WHATWG Encoding Standard で有効な宣言は実行環境に正規化させて尊重する。
+  // windows-1252 / cp1252 / latin1 / iso-8859-15 などを推定へ落とすと、
+  // 高位バイトが Shift_JIS と誤判定されることがある。
+  try {
+    return new TextDecoder(v).encoding;
+  } catch {
+    /* 非標準の崩れた宣言だけを下の互換的な部分一致へ回す */
+  }
   // charset=Shift_JIS のように余計な語が混ざる場合に備えて部分一致も見る
   if (v.includes("shift")) return "shift_jis";
   if (v.includes("euc")) return "euc-jp";
@@ -299,7 +377,12 @@ export async function fetchHtml(
   url: string,
   options: FetchOptions = {},
 ): Promise<string> {
-  const { timeoutMs = 45_000, retries = 3, headers = {} } = options;
+  const {
+    timeoutMs = 45_000,
+    retries = 3,
+    headers = {},
+    maxBytes = DEFAULT_HTML_MAX_BYTES,
+  } = options;
   let lastError: Error | undefined;
   let waitHintMs = 0;
 
@@ -329,9 +412,10 @@ export async function fetchHtml(
       const headerCharset = res.headers
         .get("content-type")
         ?.match(/charset\s*=\s*([^;]+)/i)?.[1];
-      return decodeHtml(await res.arrayBuffer(), headerCharset ?? undefined);
+      const bytes = await readResponseBytes(res, url, maxBytes);
+      return decodeHtml(bytes.buffer, headerCharset ?? undefined);
     } catch (err) {
-      if (err instanceof HttpError) throw err;
+      if (err instanceof HttpError || err instanceof ResponseTooLargeError) throw err;
       lastError = describeFetchError(err, url, timeoutMs);
     } finally {
       clearTimeout(timer);

@@ -15,12 +15,14 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import {
-  cdxSearch,
   checkAvailability,
+  crawlLinkNeighborhood,
   discoverSites,
   extractOutlinks,
   fetchArchivedPage,
   htmlToText,
+  searchCdxCatalog,
+  unwrapWaybackUrl,
 } from "./wayback.js";
 import { buildMarginaliaQuery } from "./marginalia.js";
 import { buildWarpQuery } from "./warp.js";
@@ -122,13 +124,32 @@ server.registerTool(
   },
   async (args) =>
     guard(async () => {
-      const records = await cdxSearch(args);
+      const { records, strategy, totalPages, scannedPages, sampled, note } =
+        await searchCdxCatalog(args);
+      const hints: string[] = [];
+      if (records.length === 0) {
+        hints.push(
+          "0 件でした。matchType を 'domain' に広げるか、年代指定を外して再試行してください。ホスト名が違う可能性もあります（legacy_hosts で当時のホスト一覧を確認）。",
+        );
+      } else {
+        hints.push(
+          "各 snapshotUrl は wayback_fetch_page、wayback_outlinks、crawl_link_neighborhood の入力に使えます。",
+        );
+      }
+      if (sampled) {
+        hints.push(strategy === "resumeKey"
+          ? `ページ分割 API が使えず、resumeKey 方式で ${scannedPages} 回分だけを読んだ標本です（網羅ではありません）。` +
+              "URL や年代を絞って再試行してください。"
+          : `索引 ${totalPages} ブロック中 ${scannedPages} ブロックを読んだ標本です（網羅ではありません）。` +
+              "URL や年代を絞るか、limit を上げると深く探索できます。",
+        );
+      }
+      if (note) hints.push(note);
+
       return {
         count: records.length,
-        hint:
-          records.length === 0
-            ? "0 件でした。matchType を 'domain' に広げるか、年代指定を外して再試行してください。ホスト名が違う可能性もあります（legacy_hosts で当時のホスト一覧を確認）。"
-            : "各 snapshotUrl は wayback_fetch_page や wayback_outlinks の入力に使えます。",
+        coverage: { strategy, totalPages, scannedPages, sampled },
+        hint: hints.join(" "),
         records,
       };
     }),
@@ -186,7 +207,7 @@ server.registerTool(
         );
       } else {
         hints.push(
-          "observedFiles が多いサイトほど中身が充実していた傾向があります。siteRoot を wayback_fetch_page / wayback_outlinks に渡して掘り下げてください。",
+          "observedFiles が多いサイトほど中身が充実していた傾向があります。siteRoot を wayback_fetch_page で読むか、crawl_link_neighborhood の起点にしてください。",
           "latestFirstSeen は『少なくともこの時点まで存在した』下限値で、最新キャプチャではありません（知りたいときは siteRoot を wayback_snapshot へ）。",
         );
       }
@@ -254,8 +275,7 @@ server.registerTool(
   async ({ url, timestamp, raw = false, maxChars = 8000 }) =>
     guard(async () => {
       // web.archive.org 形式で渡された場合に元 URL を取り戻す
-      const original =
-        url.match(/\/web\/\d+[a-z_]*\/(.+)$/i)?.[1] ?? url;
+      const original = unwrapWaybackUrl(url);
       const html = await fetchArchivedPage(original, timestamp);
       return {
         url: original,
@@ -276,8 +296,8 @@ server.registerTool(
     description:
       "保存済みページから外部リンクを抽出する。90年代の個人サイトは検索ではなく" +
       "相互リンクと Web リングで発見される設計だったため、当時のリンク集ページを起点に" +
-      "これを繰り返すのが、検索エンジンに載っていないマイナーな古いサイトへ到達する最有力の手段。" +
-      "リンク集・Web リング・アンテナ・ランキングサイトのページに対して使うと効果が高い。",
+      "リンク集・Web リング・アンテナ・ランキングサイトの 1 ページを確認する低レベル操作。" +
+      "複数段を自動で辿る場合は、予算と失敗処理を持つ crawl_link_neighborhood を使う。",
     inputSchema: {
       url: z.string().describe("起点となる当時の URL（リンク集ページが望ましい）"),
       timestamp: z.string().describe("14 桁タイムスタンプ"),
@@ -290,7 +310,7 @@ server.registerTool(
   },
   async ({ url, timestamp, externalOnly = true, limit = 200 }) =>
     guard(async () => {
-      const original = url.match(/\/web\/\d+[a-z_]*\/(.+)$/i)?.[1] ?? url;
+      const original = unwrapWaybackUrl(url);
       const links = await extractOutlinks(original, timestamp, {
         externalOnly,
         limit,
@@ -308,7 +328,7 @@ server.registerTool(
         count: links.length,
         distinctHosts: hosts.length,
         hint:
-          "得られた URL は wayback_snapshot で生存確認 → wayback_outlinks でさらに辿る、を繰り返すと芋づる式に広がります。",
+          "この結果は 1 ページ分です。複数段を自動で辿る場合は crawl_link_neighborhood の seeds に起点 URL を渡してください。",
         hosts,
         links,
       };
@@ -316,7 +336,74 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// 5. 当時のホスト辞書 / 検索クエリ生成
+// 5. 上限付きリンク近傍クロール — 2〜3 段の芋づるを 1 回で行う
+// ---------------------------------------------------------------------------
+server.registerTool(
+  "crawl_link_neighborhood",
+  {
+    title: "アーカイブ内リンク近傍クロール",
+    description:
+      "リンク集・ディレクトリ・Web リングなどの起点から、Wayback のスナップショットを解決しながら" +
+      "外部リンクを幅優先で最大 3 段まで辿る。検索エンジンの索引から消えた候補サイトを、" +
+      "発見元・アンカーテキスト・起点からの経路・確認できたスナップショット付きで返す。" +
+      "Internet Archive へのアクセスは逐次実行し、ページ数・1ページのリンク数・候補数を必ず制限する。" +
+      "個別ページが取得できなくても失敗を記録して残りを続行する。",
+    inputSchema: {
+      seeds: z
+        .array(z.string().min(1))
+        .min(1)
+        .max(5)
+        .describe("起点 URL（1〜5件）。当時のリンク集・カテゴリ・Web リングのページが望ましい"),
+      timestamp: z
+        .string()
+        .optional()
+        .describe("各 URL で最寄りのスナップショットを探す時点。例: '1999'。省略時は最新"),
+      maxDepth: z
+        .number()
+        .int()
+        .min(1)
+        .max(3)
+        .optional()
+        .describe("辿るリンクの段数（既定 2、最大 3）"),
+      pageBudget: z
+        .number()
+        .int()
+        .min(1)
+        .max(30)
+        .optional()
+        .describe("スナップショットを解決して展開するページ数（既定 8、最大 30）"),
+      linksPerPage: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .optional()
+        .describe("各ページから採用するリンク数（既定 40、最大 100）"),
+      candidateBudget: z
+        .number()
+        .int()
+        .min(1)
+        .max(500)
+        .optional()
+        .describe("重複排除後に保持する URL 数（起点を含む。既定 200、最大 500）"),
+      externalOnly: z
+        .boolean()
+        .optional()
+        .describe("取得元と別ホストのリンクだけを辿る（既定 true）"),
+      keywords: z
+        .array(z.string().min(1).max(120))
+        .max(10)
+        .optional()
+        .describe(
+          "候補を順位付けする主題語（最大10件）。URLとアンカーテキストだけを照合し、本文フィルタはしない",
+        ),
+    },
+  },
+  async (params) => guard(() => crawlLinkNeighborhood(params)),
+);
+
+// ---------------------------------------------------------------------------
+// 6. 当時のホスト辞書 / 検索クエリ生成
 // ---------------------------------------------------------------------------
 server.registerTool(
   "legacy_hosts",
@@ -429,9 +516,9 @@ server.registerTool(
         periodPhrases: periodPhrases(lang),
         hint:
           "siteQueries は 1 本ずつ WebSearch に投げること（OR を繋げすぎると検索側に無視されます）。" +
-          "ヒットしたらその URL を wayback_cdx_search と wayback_outlinks に渡して掘り下げます。" +
+          "ヒットしたらその URL を wayback_cdx_search と crawl_link_neighborhood に渡して掘り下げます。" +
           "なお当時のホストは現行検索の索引からほぼ消えているため、この経路の期待値は低いです。" +
-          "実際に届くのは discover_sites → wayback_outlinks の芋づるなので、そちらを主軸にしてください。" +
+          "実際に届くのは discover_sites → crawl_link_neighborhood の芋づるなので、そちらを主軸にしてください。" +
           (region === "jp"
             ? ""
             : " 海外の主題なら wiby_search（旧式ページ専門の全文検索）も併用してください。こちらは実際にヒットします。"),
@@ -440,7 +527,7 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// 6. Wiby — 海外の古いサイトに対してだけ成立する全文検索
+// 7. Wiby — 海外の古いサイトに対してだけ成立する全文検索
 // ---------------------------------------------------------------------------
 server.registerTool(
   "wiby_search",
@@ -470,7 +557,7 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// 7. Marginalia（海外の非商業サイト向け。URL 生成のみ）
+// 8. Marginalia（海外の非商業サイト向け。URL 生成のみ）
 // ---------------------------------------------------------------------------
 server.registerTool(
   "marginalia_search_url",
@@ -491,7 +578,7 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// 8. NDL WARP（日本語サイト向け。URL 生成のみ）
+// 9. NDL WARP（日本語サイト向け。URL 生成のみ）
 // ---------------------------------------------------------------------------
 server.registerTool(
   "warp_search_url",
@@ -520,7 +607,7 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// 9. 探索戦略ガイド — /drdr など、ツールだけ見て手順が分からない呼び出し元向け
+// 10. 探索戦略ガイド — /drdr など、ツールだけ見て手順が分からない呼び出し元向け
 // ---------------------------------------------------------------------------
 
 /** 海外を探すときだけ差し込む手順。日本語圏との違いが大きい箇所に絞る。 */
@@ -532,7 +619,7 @@ const INTL_STEPS = [
     detail:
       "Wiby は旧式の手打ちページだけを索引しているので、主題を英語 1〜2 語で叩くと" +
       "当時の空気のサイトが直接返る。日本語圏には同等の索引が存在しない。" +
-      "ヒットしたサイトの URL をそのまま wayback_outlinks へ渡して芋づるに接続する。",
+      "ヒットしたサイトの URL をそのまま crawl_link_neighborhood の seeds へ渡して芋づるに接続する。",
   },
   {
     step: "海外 2",
@@ -550,7 +637,7 @@ const INTL_STEPS = [
   {
     step: "海外 3",
     action: "DMOZ / Yahoo! Directory 本家のカテゴリページを起点にする",
-    tool: "wayback_cdx_search → wayback_outlinks",
+    tool: "wayback_cdx_search → crawl_link_neighborhood",
     detail:
       "例: url='dmoz.org/Recreation', from='1999', to='2003'。" +
       "DMOZ（2017 終了）は海外版の dir.yahoo.co.jp に当たる最大の人力名簿で、" +
@@ -560,7 +647,7 @@ const INTL_STEPS = [
   {
     step: "海外 4",
     action: "Web リングのハブから参加サイト一覧を取る",
-    tool: "wayback_outlinks",
+    tool: "crawl_link_neighborhood",
     detail:
       "www.webring.org / www.ringsurf.com / www.bomis.com のリング一覧ページは、" +
       "同じ主題の個人サイトが数十件ずつ並ぶ。日本語圏の webring.ne.jp と同じ使い方。",
@@ -648,10 +735,11 @@ server.registerTool(
         },
         {
           step: 5,
-          action: "合致したサイトの『リンク』ページで芋づるを繰り返す",
-          tool: "wayback_outlinks",
+          action: "合致したサイトの『リンク』ページから 2〜3 段を上限付きで辿る",
+          tool: "crawl_link_neighborhood",
           detail:
-            "当時のサイトはほぼ必ずリンクページを持つ。ここを再帰的に辿るのが最も深く潜れる。2〜3 段辿ると検索では絶対に出ないサイトに届く。",
+            "当時のサイトはほぼ必ずリンクページを持つ。seeds に起点 URL、timestamp に狙う年代、keywords に主題語を渡す。" +
+            "既定 2 段、最大 3 段で、発見経路・アンカー・スナップショット・失敗・coverage がまとめて返る。",
         },
         {
           step: 6,
@@ -679,6 +767,8 @@ server.registerTool(
           "そもそも step 6 は補助であり、主力は step 2-b と step 5 の芋づる。",
         "discover_sites にホスト名だけを渡した結果は網羅ではなく標本（coverage.sampled=true）。" +
           "出てきたエリア名で呼び直すと、そのエリアは網羅に近づく。",
+        "crawl_link_neighborhood の coverage.truncated=true は、pageBudget、candidateBudget、または linksPerPage の上限に触れた印。" +
+          "reasons を見て必要な上限だけ増やすか、score の高い siteRoot を次の seeds にして探索を分割する。",
         "WARP は 2002 年以降の収集で、90年代はほぼ入っていない。90年代狙いなら Wayback 一択。",
         "Marginalia も Wiby も英語専用で、日本語クエリはほぼ 0 件。日本語圏では使わない。",
         "アーカイブに残っていても robots 除外やサーバ消滅で本文が取れないことがある。複数の年代のスナップショットを試す。",
@@ -686,10 +776,10 @@ server.registerTool(
       ],
       topicSpecific: topic
         ? region === "jp"
-          ? `主題「${topic}」については、まず build_retro_queries で site: クエリを生成して当たりを付け、` +
-            `ヒットした 1 サイトの URL を wayback_outlinks に入れて周辺サイトへ広げるのが速い。`
+          ? `主題「${topic}」については、まず discover_sites か build_retro_queries で起点を得て、` +
+            `crawl_link_neighborhood の seeds に URL、keywords に「${topic}」を渡して周辺サイトへ広げるのが速い。`
           : `主題「${topic}」については、まず wiby_search に英語 1〜2 語で投げて生きている旧式サイトを掴み、` +
-            `その URL を wayback_outlinks に入れて当時のリンク集へ遡るのが速い。` +
+            `その URL を crawl_link_neighborhood の seeds に入れて当時のリンク集へ遡るのが速い。` +
             `並行して discover_sites に www.geocities.com の主題に合うエリアを渡す。`
         : undefined,
     })),

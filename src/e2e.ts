@@ -55,6 +55,7 @@ await check("tools/list", async () => {
     "wayback_snapshot",
     "wayback_fetch_page",
     "wayback_outlinks",
+    "crawl_link_neighborhood",
     "legacy_hosts",
     "build_retro_queries",
     "wiby_search",
@@ -71,6 +72,9 @@ await check("tools/list", async () => {
 await check("retro_search_strategy", async () => {
   const r = await call("retro_search_strategy", { topic: "個人 日記サイト" });
   if (!Array.isArray(r.steps) || r.steps.length < 5) throw new Error("手順が不足");
+  if (!(r.steps as { tool: string }[]).some((step) => step.tool === "crawl_link_neighborhood")) {
+    throw new Error("複数段の芋づる手順が新ツールへ切り替わっていない");
+  }
   return `${r.steps.length} ステップ / 落とし穴 ${r.pitfalls.length} 件`;
 });
 
@@ -98,10 +102,14 @@ await check("実地: ジオシティーズ配下の個人サイト列挙", async
     mimeType: "text/html",
   });
   if (r.count === 0) throw new Error("0 件");
+  const coverage = r.coverage as { strategy?: string; sampled?: boolean } | undefined;
+  if (!coverage || coverage.strategy === "direct") {
+    throw new Error("広い CDX 検索が分割走査になっていない");
+  }
   const users = (r.records as { original: string }[])
     .map((x) => x.original.match(/Playtown\/(\d+)/)?.[1])
     .filter(Boolean);
-  return `${r.count} 件のスナップショット / 個人ID 例: ${[...new Set(users)].slice(0, 5).join(", ")}`;
+  return `${r.count} 件 / ${coverage.strategy} / 個人ID 例: ${[...new Set(users)].slice(0, 5).join(", ")}`;
 });
 
 await check("実地: 無名の個人サイトを列挙できるか（本サーバの中核）", async () => {
@@ -166,6 +174,29 @@ await check("実地: リンク集からの芋づる（別ホストへ到達で�
   });
   if (links.count === 0) throw new Error("リンク 0 件");
   return `${links.count} リンク / ${links.distinctHosts} ホスト / 例: ${links.hosts.slice(0, 4).join(", ")}`;
+});
+
+await check("実地: 予算付きリンク近傍クロール", async () => {
+  const result = await call("crawl_link_neighborhood", {
+    seeds: ["www.yahoo.co.jp"],
+    timestamp: "1997",
+    maxDepth: 2,
+    pageBudget: 1,
+    linksPerPage: 20,
+    candidateBudget: 25,
+    externalOnly: false,
+    keywords: ["Yahoo"],
+  });
+  const candidate = (result.sites as { seed: boolean; route: string[] }[]).find(
+    (site) => !site.seed,
+  );
+  if (!candidate) throw new Error("起点以外の候補サイトが 0 件");
+  if (candidate.route.length < 2) throw new Error("起点からの経路が無い");
+  if (result.coverage.pagesAttempted !== 1) throw new Error("pageBudget を超過");
+  if (!result.coverage.reasons.includes("page_budget")) {
+    throw new Error("打ち切り理由に page_budget が無い");
+  }
+  return `${result.coverage.discoveredSites} サイト / ${result.coverage.uniqueUrls} URL`;
 });
 
 // --- 海外の発掘が通しで成立するか ---

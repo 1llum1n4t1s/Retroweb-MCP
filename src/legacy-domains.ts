@@ -799,7 +799,7 @@ const INTL_HOSTS: LegacyHost[] = [
     searchIndex: "retro",
     note:
       "人力分類の世界最大ディレクトリ。2017 年終了。海外版の dir.yahoo.co.jp に相当する最大の名簿。" +
-      "アーカイブ上のカテゴリページを wayback_outlinks に掛けるのが海外探索の主力",
+      "アーカイブ上のカテゴリページを crawl_link_neighborhood の起点にするのが海外探索の主力",
   },
   {
     domain: "dir.yahoo.com",
@@ -938,11 +938,18 @@ export function buildPhraseQueries(
 
 export type PhraseLang = "ja" | "en";
 
-/** 言語で言い回しを絞る。'both' は日英を交互に混ぜず、日→英の順で連結する */
+/** 言語で言い回しを絞る。'both' は既定件数内に両言語が入るよう日英を交互にする。 */
 export function periodPhrases(lang: PhraseLang | "both" = "ja"): PeriodPhrase[] {
-  return lang === "both"
-    ? PERIOD_PHRASES
-    : PERIOD_PHRASES.filter((p) => p.lang === lang);
+  if (lang !== "both") return PERIOD_PHRASES.filter((p) => p.lang === lang);
+
+  const ja = PERIOD_PHRASES.filter((p) => p.lang === "ja");
+  const en = PERIOD_PHRASES.filter((p) => p.lang === "en");
+  const mixed: PeriodPhrase[] = [];
+  for (let i = 0; i < Math.max(ja.length, en.length); i++) {
+    if (ja[i]) mixed.push(ja[i]);
+    if (en[i]) mixed.push(en[i]);
+  }
+  return mixed;
 }
 
 /** 地域に対応する言い回しの言語。日本以外は英語で当たる */
@@ -1042,6 +1049,7 @@ export const PERIOD_PHRASES: PeriodPhrase[] = [
   { phrase: "リンクフリー", note: "ほぼ全ての個人サイトのトップに書かれていた", lang: "ja" },
   { phrase: "キリ番", note: "アクセスカウンタの区切り番号。踏み逃げ禁止とセット", lang: "ja" },
   { phrase: "相互リンク募集", note: "リンク集ページに頻出。芋づるの起点になる", lang: "ja" },
+  { phrase: "工事中", note: "Under Construction。未完成ページの定番", lang: "ja" },
   { phrase: "当サイトはリンクフリーです", note: "定型文そのものを完全一致で検索する", lang: "ja" },
   { phrase: "ご自由にお持ち帰りください", note: "素材配布サイトの定型句", lang: "ja" },
   { phrase: "画像は直リンク禁止", note: "素材・イラストサイト", lang: "ja" },
@@ -1050,7 +1058,6 @@ export const PERIOD_PHRASES: PeriodPhrase[] = [
   { phrase: "Netscape Navigator", note: "推奨ブラウザ表記。1995〜1999 年の強い指標", lang: "ja" },
   { phrase: "IE4.0 以上推奨", note: "1998〜2001 年頃の指標", lang: "ja" },
   { phrase: "800×600", note: "推奨解像度表記。90 年代後半の指標", lang: "ja" },
-  { phrase: "工事中", note: "Under Construction。未完成ページの定番", lang: "ja" },
   { phrase: "はじめまして", note: "自己紹介ページの書き出し", lang: "ja" },
   { phrase: "きりばん", note: "ひらがな表記の揺れも試す価値がある", lang: "ja" },
   { phrase: "web拍手", note: "2002 年以降のテキストサイト・同人系", lang: "ja" },

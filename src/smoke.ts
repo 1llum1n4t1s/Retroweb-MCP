@@ -6,7 +6,16 @@
  * `pnpm smoke` で実行する。
  */
 
-import { cdxSearch, checkAvailability, discoverSites, extractOutlinks, fetchArchivedPage, htmlToText, siteRootOf } from "./wayback.js";
+import {
+  cdxSearch,
+  checkAvailability,
+  crawlLinkNeighborhood,
+  discoverSites,
+  extractOutlinks,
+  fetchArchivedPage,
+  htmlToText,
+  siteRootOf,
+} from "./wayback.js";
 import { buildMarginaliaQuery } from "./marginalia.js";
 import { buildWarpQuery } from "./warp.js";
 import { wibySearch } from "./wiby.js";
@@ -88,6 +97,30 @@ await check("extractOutlinks (Yahoo! JAPAN 1997 トップ)", async () => {
   });
   if (links.length === 0) throw new Error("リンク 0 件");
   return `${links.length} 件 / 例: ${links[0].text || "(no text)"} -> ${links[0].url}`;
+});
+
+await check("crawlLinkNeighborhood (1ページ予算で経路と打ち切りを返す)", async () => {
+  if (!sample) throw new Error("前段のスナップショット取得が失敗しているため実行不可");
+  const result = await crawlLinkNeighborhood({
+    seeds: [sample.url],
+    timestamp: sample.timestamp,
+    maxDepth: 2,
+    pageBudget: 1,
+    linksPerPage: 20,
+    candidateBudget: 25,
+    externalOnly: false,
+    keywords: ["Yahoo"],
+  });
+  const candidate = result.sites.find((site) => !site.seed);
+  if (!candidate) throw new Error("起点以外の候補サイトが 0 件");
+  if (candidate.route.length < 2) throw new Error("発見経路が保持されていない");
+  if (result.coverage.pagesAttempted !== 1) {
+    throw new Error(`pageBudget が守られていない: ${result.coverage.pagesAttempted}`);
+  }
+  if (!result.coverage.truncated || !result.coverage.reasons.includes("page_budget")) {
+    throw new Error("ページ予算による打ち切りが coverage に出ていない");
+  }
+  return `${result.coverage.discoveredSites} サイト / 経路 ${candidate.route.join(" -> ")}`;
 });
 
 await check("buildMarginaliaQuery (日本語入力には警告が付くこと)", async () => {

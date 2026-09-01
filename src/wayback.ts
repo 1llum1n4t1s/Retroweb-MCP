@@ -14,12 +14,17 @@ import { fetchHtml, fetchJson, fetchText } from "./http.js";
  * リンク抽出の前に必ずここを通して絶対 URL 化する。
  */
 export function normalizeUrl(input: string): string {
-  const trimmed = input.trim();
-  // web.archive.org 形式で渡された場合は元 URL を取り戻す
-  const unwrapped =
-    trimmed.match(/^(?:https?:\/\/web\.archive\.org)?\/web\/\d+[a-z_]*\/(.+)$/i)?.[1] ??
-    trimmed;
+  const unwrapped = unwrapWaybackUrl(input);
   return /^https?:\/\//i.test(unwrapped) ? unwrapped : `http://${unwrapped}`;
+}
+
+/** 完全な Wayback URL だけを元 URL へ戻し、通常 URL 内の /web/<数字>/ は維持する。 */
+export function unwrapWaybackUrl(input: string): string {
+  const trimmed = input.trim();
+  return (
+    trimmed.match(/^(?:https?:\/\/web\.archive\.org)?\/web\/\d+[a-z_]*\/(.+)$/i)?.[1] ??
+    trimmed
+  );
 }
 
 const CDX_ENDPOINT = "https://web.archive.org/cdx/search/cdx";
@@ -166,8 +171,11 @@ async function cdxNumPages(params: CdxSearchParams): Promise<number> {
   query.delete("output");
   query.delete("fl");
   const body = await fetchText(`${CDX_ENDPOINT}?${query}`, { timeoutMs: 45_000 });
-  const n = Number(body.trim());
-  return Number.isFinite(n) && n > 0 ? n : 0;
+  const normalized = body.trim();
+  if (!/^\d+$/.test(normalized)) {
+    throw new Error(`CDX の総ブロック数が不正です: ${normalized}`);
+  }
+  return Number(normalized);
 }
 
 /** totalPages のうち want ページ分を、範囲全体へ均等に散らして選ぶ */
@@ -195,13 +203,15 @@ const MAX_SCAN_PAGES = 24;
 
 export interface ScanResult {
   records: CdxRecord[];
+  /** direct=完全一致、paged=ブロック分割、resumeKey=旧来の継続キー */
+  strategy: "direct" | "paged" | "resumeKey";
   /** CDX 索引の総ブロック数（対象の規模） */
   totalPages: number;
   /** 実際に読んだブロック数 */
   scannedPages: number;
   /** 全ブロックを読み切れず、間引いて標本抽出したか */
   sampled: boolean;
-  /** ページ分割 API が使えず旧方式へ落ちたときの説明 */
+  /** 走査方法のフォールバックや一部取得失敗の説明 */
   note?: string;
 }
 
@@ -221,14 +231,24 @@ async function cdxScan(
     Math.max(MIN_SCAN_PAGES, Math.ceil(maxRecords / ROWS_PER_PAGE_ESTIMATE)),
   ),
 ): Promise<ScanResult> {
-  let totalPages = 0;
+  let totalPages: number | undefined;
   try {
     totalPages = await cdxNumPages(params);
   } catch {
     /* ページ分割 API が使えない場合は下の resumeKey 方式へ落ちる */
   }
 
-  if (totalPages > 0) {
+  if (totalPages !== undefined) {
+    if (totalPages === 0) {
+      return {
+        records: [],
+        strategy: "paged",
+        totalPages: 0,
+        scannedPages: 0,
+        sampled: false,
+      };
+    }
+
     // 予算いっぱいのブロックを範囲全体へ散らして選ぶ。
     const pages = spreadPages(totalPages, maxRequests);
     // 件数の予算はブロックへ均等に配る。前詰めで取ると、行数の多いブロックが
@@ -236,9 +256,14 @@ async function cdxScan(
     const perPage = Math.max(1, Math.ceil(maxRecords / pages.length));
     const records: CdxRecord[] = [];
     let scannedPages = 0;
+    let failedPages = 0;
+    let truncated = false;
 
     for (const page of pages) {
-      if (records.length >= maxRecords) break;
+      if (records.length >= maxRecords) {
+        truncated = true;
+        break;
+      }
       const query = scanQuery(params);
       query.set("page", String(page));
 
@@ -247,6 +272,7 @@ async function cdxScan(
       try {
         rows = await fetchJson<string[][]>(`${CDX_ENDPOINT}?${query}`);
       } catch {
+        failedPages++;
         continue;
       }
       scannedPages++;
@@ -254,7 +280,10 @@ async function cdxScan(
 
       let taken = 0;
       for (const row of rows.slice(1)) {
-        if (taken >= perPage || records.length >= maxRecords) break;
+        if (taken >= perPage || records.length >= maxRecords) {
+          truncated = true;
+          break;
+        }
         const rec = toRecord(row);
         if (rec) {
           records.push(rec);
@@ -263,14 +292,20 @@ async function cdxScan(
       }
     }
 
-    if (scannedPages > 0) {
-      return {
-        records,
-        totalPages,
-        scannedPages,
-        sampled: scannedPages < totalPages,
-      };
-    }
+    return {
+      records,
+      strategy: "paged",
+      totalPages,
+      scannedPages,
+      sampled: scannedPages < totalPages || truncated,
+      ...(failedPages > 0
+        ? {
+            note:
+              `選択した ${pages.length} ブロック中 ${failedPages} ブロックを取得できませんでした。` +
+              "総ブロック数は取得済みのため、先頭へ偏る resumeKey 方式には切り替えていません。",
+          }
+        : {}),
+    };
   }
 
   return {
@@ -293,6 +328,7 @@ async function cdxResumeScan(
   const collected: CdxRecord[] = [];
   let resumeKey: string | undefined;
   let scannedPages = 0;
+  let exhausted = false;
 
   for (let page = 0; page < maxPages && collected.length < maxRecords; page++) {
     const query = scanQuery(params);
@@ -301,8 +337,13 @@ async function cdxResumeScan(
     if (resumeKey) query.set("resumeKey", resumeKey);
 
     const rows = await fetchJson<string[][]>(`${CDX_ENDPOINT}?${query}`);
-    if (!Array.isArray(rows) || rows.length < 2) break;
+    if (!Array.isArray(rows) || rows.length === 0) break;
     scannedPages++;
+
+    if (rows.length === 1) {
+      exhausted = true;
+      break;
+    }
 
     const [, ...data] = rows;
 
@@ -316,15 +357,45 @@ async function cdxResumeScan(
     }
 
     for (const row of data) {
+      if (collected.length >= maxRecords) break;
       const rec = toRecord(row);
       if (rec) collected.push(rec);
     }
 
-    if (!nextKey) break;
+    if (!nextKey) {
+      exhausted = true;
+      break;
+    }
     resumeKey = nextKey;
   }
 
-  return { records: collected, totalPages: 0, scannedPages, sampled: false };
+  return {
+    records: collected,
+    strategy: "resumeKey",
+    totalPages: 0,
+    scannedPages,
+    sampled: !exhausted,
+  };
+}
+
+/**
+ * 公開ツール向けの CDX 検索。
+ * 完全一致は軽量な直接検索を保ち、prefix / host / domain は有界なブロック走査へ送る。
+ */
+export async function searchCdxCatalog(params: CdxSearchParams): Promise<ScanResult> {
+  const matchType = params.matchType ?? "prefix";
+  if (matchType === "exact") {
+    return {
+      records: await cdxSearch({ ...params, matchType }),
+      strategy: "direct",
+      totalPages: 0,
+      scannedPages: 0,
+      sampled: false,
+    };
+  }
+
+  const maxRecords = Math.max(1, Math.abs(params.limit ?? 100));
+  return cdxScan({ ...params, matchType }, maxRecords);
 }
 
 /**
@@ -975,6 +1046,459 @@ export async function extractOutlinks(
   }
 
   return results;
+}
+
+export interface CrawlLinkNeighborhoodParams {
+  /** 探索を始める当時の URL。リンク集・ディレクトリ・Web リングのハブが向く。 */
+  seeds: string[];
+  /** 各 URL でこの時点に最も近いスナップショットを選ぶ。省略時は最新。 */
+  timestamp?: string;
+  /** 辿るリンクの段数。Internet Archive への負荷を抑えるため最大 3。 */
+  maxDepth?: number;
+  /** 実際にスナップショットを解決してリンクを読むページ数。 */
+  pageBudget?: number;
+  /** 1 ページから採用するリンク数。 */
+  linksPerPage?: number;
+  /** 重複排除後に保持する URL 候補数（起点を含む）。 */
+  candidateBudget?: number;
+  /** 取得元と別ホストのリンクだけを辿る。 */
+  externalOnly?: boolean;
+  /** URL とアンカーテキストだけに適用する順位付け用キーワード。 */
+  keywords?: string[];
+}
+
+export type CrawlPageStatus = "expanded" | "unavailable" | "failed";
+
+export interface CrawlPageResult {
+  url: string;
+  siteRoot: string;
+  depth: number;
+  status: CrawlPageStatus;
+  snapshotUrl?: string;
+  snapshotTimestamp?: string;
+  outlinkCount?: number;
+  note?: string;
+}
+
+export interface CrawlSiteResult {
+  siteRoot: string;
+  /** このサイト根を代表する、実際にリンクされていた URL。 */
+  sampleUrl: string;
+  minDepth: number;
+  seed: boolean;
+  discoveredFrom?: string;
+  anchorText: string;
+  /** 起点から sampleUrl までの最短発見経路。 */
+  route: string[];
+  /** クロール中にこのサイト根へ向いたリンク数。 */
+  references: number;
+  /** URL またはアンカーテキストで一致したキーワード。本文検索ではない。 */
+  keywordMatches: string[];
+  /** keywordMatches×10 + 被参照数（最大5）+ 近い深さ、の単純な優先度。 */
+  score: number;
+  snapshot?: {
+    originalUrl: string;
+    archivedUrl?: string;
+    timestamp: string;
+  };
+}
+
+export interface CrawlFailure {
+  url: string;
+  depth: number;
+  kind: "unavailable" | "fetch_error";
+  message: string;
+}
+
+export interface CrawlLinkNeighborhoodResult {
+  criteria: {
+    seeds: string[];
+    timestamp?: string;
+    maxDepth: number;
+    pageBudget: number;
+    linksPerPage: number;
+    candidateBudget: number;
+    externalOnly: boolean;
+    keywords: string[];
+    scoring: string;
+  };
+  coverage: {
+    pagesAttempted: number;
+    pagesExpanded: number;
+    pendingPages: number;
+    uniqueUrls: number;
+    uniqueSites: number;
+    discoveredSites: number;
+    skippedNonPageLinks: number;
+    skippedCandidateLinks: number;
+    pageLinkLimitHits: number;
+    truncated: boolean;
+    reasons: Array<"page_budget" | "candidate_budget" | "per_page_link_limit">;
+  };
+  /** 起点以外を先、score 降順、近い depth 順で並べる。 */
+  sites: CrawlSiteResult[];
+  /** 実際にページ予算を消費した URL と結果。 */
+  pages: CrawlPageResult[];
+  failures: CrawlFailure[];
+}
+
+type PendingPageStatus = "queued" | "discovered";
+
+interface CrawlNode {
+  url: string;
+  siteRoot: string;
+  depth: number;
+  discoveredFrom?: string;
+  anchorText: string;
+  route: string[];
+  status: PendingPageStatus | CrawlPageStatus;
+  snapshotUrl?: string;
+  snapshotTimestamp?: string;
+  outlinkCount?: number;
+  note?: string;
+}
+
+interface MutableCrawlSite {
+  siteRoot: string;
+  sampleUrl: string;
+  minDepth: number;
+  seed: boolean;
+  discoveredFrom?: string;
+  anchorText: string;
+  route: string[];
+  references: number;
+  keywordMatches: Set<string>;
+  sampleMatchCount: number;
+  snapshot?: CrawlSiteResult["snapshot"];
+}
+
+const NON_PAGE_EXTENSION_RE =
+  /\.(?:7z|avi|bmp|css|csv|docx?|eot|exe|flac|gif|ico|jpe?g|js|json|lzh|midi?|mov|mp3|mp4|mpeg|ogg|pdf|png|pptx?|rar|rss|svg|tar|tiff?|ttf|txt|wav|webm|webp|woff2?|xlsx?|xml|zip)$/i;
+
+function boundedInteger(
+  value: number | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+  name: string,
+): number {
+  const actual = value ?? fallback;
+  if (!Number.isInteger(actual) || actual < min || actual > max) {
+    throw new Error(`${name} は ${min}〜${max} の整数で指定してください。`);
+  }
+  return actual;
+}
+
+/** ハッシュだけを落とし、クエリは Web リング等の識別に必要なので維持する。 */
+function canonicalCrawlUrl(rawUrl: string): string | null {
+  try {
+    const url = new URL(normalizeUrl(rawUrl));
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+/** HTML を持たないことが明白な静的ファイルだけを探索対象から外す。 */
+function isLikelyPageUrl(rawUrl: string): boolean {
+  try {
+    const pathname = new URL(rawUrl).pathname;
+    return !NON_PAGE_EXTENSION_RE.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
+/** siteRootOf がホスト直下ページを返せない場合も、ホスト根へ安全に畳む。 */
+function crawlSiteRoot(rawUrl: string): string {
+  const inferred = siteRootOf(rawUrl);
+  if (inferred) return inferred;
+  const url = new URL(rawUrl);
+  return `http://${url.host.replace(/:80$/, "")}/`;
+}
+
+function matchingKeywords(url: string, text: string, keywords: string[]): string[] {
+  let decodedUrl = url;
+  try {
+    decodedUrl = decodeURIComponent(url);
+  } catch {
+    /* 壊れたパーセントエンコードは生 URL のまま照合する */
+  }
+  const haystack = `${decodedUrl} ${text}`.toLocaleLowerCase();
+  return keywords.filter((keyword) => haystack.includes(keyword.toLocaleLowerCase()));
+}
+
+/**
+ * 保存済みページのリンク近傍を、上限付き BFS で 2〜3 段だけ辿る。
+ *
+ * Internet Archive はレート制限が強いため、ページ取得は意図的に逐次実行する。
+ * 個別 URL の失敗は収集して後続候補へ進み、全探索を 1 件の失敗で捨てない。
+ */
+export async function crawlLinkNeighborhood(
+  params: CrawlLinkNeighborhoodParams,
+): Promise<CrawlLinkNeighborhoodResult> {
+  if (params.seeds.length < 1 || params.seeds.length > 5) {
+    throw new Error("seeds は 1〜5 件で指定してください。");
+  }
+
+  const maxDepth = boundedInteger(params.maxDepth, 2, 1, 3, "maxDepth");
+  const pageBudget = boundedInteger(params.pageBudget, 8, 1, 30, "pageBudget");
+  const linksPerPage = boundedInteger(params.linksPerPage, 40, 1, 100, "linksPerPage");
+  const candidateBudget = boundedInteger(
+    params.candidateBudget,
+    200,
+    1,
+    500,
+    "candidateBudget",
+  );
+  const externalOnly = params.externalOnly ?? true;
+  const keywords = [
+    ...new Set((params.keywords ?? []).map((keyword) => keyword.trim()).filter(Boolean)),
+  ];
+  if (keywords.length > 10) throw new Error("keywords は 10 件以下で指定してください。");
+
+  const seeds: string[] = [];
+  for (const rawSeed of params.seeds) {
+    const seed = canonicalCrawlUrl(rawSeed);
+    if (!seed) throw new Error(`URL を解釈できません: '${rawSeed}'`);
+    if (!seeds.includes(seed)) seeds.push(seed);
+  }
+  if (candidateBudget < seeds.length) {
+    throw new Error(`candidateBudget は重複排除後の seeds 件数（${seeds.length}）以上にしてください。`);
+  }
+
+  const nodes = new Map<string, CrawlNode>();
+  const sites = new Map<string, MutableCrawlSite>();
+  const queue: string[] = [];
+  const attempted: string[] = [];
+  const failures: CrawlFailure[] = [];
+  let pagesExpanded = 0;
+  let skippedNonPageLinks = 0;
+  let skippedCandidateLinks = 0;
+  let pageLinkLimitHits = 0;
+
+  const recordSite = (node: CrawlNode, seed: boolean, referenceIncrement: number): void => {
+    const matches = matchingKeywords(node.url, node.anchorText, keywords);
+    const current = sites.get(node.siteRoot);
+    if (!current) {
+      sites.set(node.siteRoot, {
+        siteRoot: node.siteRoot,
+        sampleUrl: node.url,
+        minDepth: node.depth,
+        seed,
+        discoveredFrom: node.discoveredFrom,
+        anchorText: node.anchorText,
+        route: node.route,
+        references: referenceIncrement,
+        keywordMatches: new Set(matches),
+        sampleMatchCount: matches.length,
+      });
+      return;
+    }
+
+    current.seed ||= seed;
+    current.minDepth = Math.min(current.minDepth, node.depth);
+    current.references += referenceIncrement;
+    for (const match of matches) current.keywordMatches.add(match);
+
+    // 同じサイトから複数 URL が出た場合、主題語を多く含む経路を代表例にする。
+    if (matches.length > current.sampleMatchCount) {
+      current.sampleUrl = node.url;
+      current.discoveredFrom = node.discoveredFrom;
+      current.anchorText = node.anchorText;
+      current.route = node.route;
+      current.sampleMatchCount = matches.length;
+    }
+  };
+
+  for (const seed of seeds) {
+    const node: CrawlNode = {
+      url: seed,
+      siteRoot: crawlSiteRoot(seed),
+      depth: 0,
+      anchorText: "",
+      route: [seed],
+      status: "queued",
+    };
+    nodes.set(seed, node);
+    queue.push(seed);
+    recordSite(node, true, 0);
+  }
+
+  while (queue.length > 0 && attempted.length < pageBudget) {
+    const currentUrl = queue.shift();
+    if (!currentUrl) break;
+    const node = nodes.get(currentUrl);
+    if (!node || node.status !== "queued") continue;
+
+    attempted.push(currentUrl);
+    let availability: AvailabilityResult;
+    try {
+      availability = await checkAvailability(currentUrl, params.timestamp);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      node.status = "failed";
+      node.note = message;
+      failures.push({ url: currentUrl, depth: node.depth, kind: "fetch_error", message });
+      continue;
+    }
+
+    if (!availability.available || !availability.timestamp) {
+      const message = availability.note ?? "指定時点付近のスナップショットが見つかりませんでした。";
+      node.status = "unavailable";
+      node.note = message;
+      failures.push({ url: currentUrl, depth: node.depth, kind: "unavailable", message });
+      continue;
+    }
+
+    node.snapshotUrl = availability.url;
+    node.snapshotTimestamp = availability.timestamp;
+    const site = sites.get(node.siteRoot);
+    if (site && (!site.snapshot || site.sampleUrl === currentUrl)) {
+      site.snapshot = {
+        originalUrl: currentUrl,
+        archivedUrl: availability.url,
+        timestamp: availability.timestamp,
+      };
+    }
+
+    try {
+      // 上限より 1 件だけ多く見ることで、ちょうど上限件だった場合を「打ち切り」と誤判定しない。
+      const extractedLinks = await extractOutlinks(currentUrl, availability.timestamp, {
+        externalOnly,
+        limit: linksPerPage + 1,
+      });
+      const links = extractedLinks.slice(0, linksPerPage);
+      node.status = "expanded";
+      node.outlinkCount = links.length;
+      pagesExpanded++;
+      if (extractedLinks.length > linksPerPage) pageLinkLimitHits++;
+
+      for (const link of links) {
+        const candidate = canonicalCrawlUrl(link.url);
+        if (!candidate || !isLikelyPageUrl(candidate)) {
+          skippedNonPageLinks++;
+          continue;
+        }
+
+        const existing = nodes.get(candidate);
+        if (existing) {
+          recordSite(
+            {
+              ...existing,
+              anchorText: link.text || existing.anchorText,
+            },
+            false,
+            1,
+          );
+          continue;
+        }
+
+        if (nodes.size >= candidateBudget) {
+          skippedCandidateLinks++;
+          continue;
+        }
+
+        const depth = node.depth + 1;
+        const candidateNode: CrawlNode = {
+          url: candidate,
+          siteRoot: crawlSiteRoot(candidate),
+          depth,
+          discoveredFrom: currentUrl,
+          anchorText: link.text,
+          route: [...node.route, candidate],
+          status: depth < maxDepth ? "queued" : "discovered",
+        };
+        nodes.set(candidate, candidateNode);
+        recordSite(candidateNode, false, 1);
+        if (candidateNode.status === "queued") queue.push(candidate);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      node.status = "failed";
+      node.note = message;
+      failures.push({ url: currentUrl, depth: node.depth, kind: "fetch_error", message });
+    }
+  }
+
+  const reasons: CrawlLinkNeighborhoodResult["coverage"]["reasons"] = [];
+  if (queue.length > 0) reasons.push("page_budget");
+  if (skippedCandidateLinks > 0) reasons.push("candidate_budget");
+  if (pageLinkLimitHits > 0) reasons.push("per_page_link_limit");
+
+  const siteResults = [...sites.values()]
+    .map<CrawlSiteResult>((site) => {
+      const keywordMatches = [...site.keywordMatches];
+      return {
+        siteRoot: site.siteRoot,
+        sampleUrl: site.sampleUrl,
+        minDepth: site.minDepth,
+        seed: site.seed,
+        discoveredFrom: site.discoveredFrom,
+        anchorText: site.anchorText,
+        route: site.route,
+        references: site.references,
+        keywordMatches,
+        score:
+          keywordMatches.length * 10 +
+          Math.min(site.references, 5) +
+          Math.max(0, maxDepth - site.minDepth),
+        snapshot: site.snapshot,
+      };
+    })
+    .sort((a, b) => {
+      if (a.seed !== b.seed) return a.seed ? 1 : -1;
+      return b.score - a.score || a.minDepth - b.minDepth || a.siteRoot.localeCompare(b.siteRoot);
+    });
+
+  const pageResults = attempted.flatMap<CrawlPageResult>((url) => {
+    const node = nodes.get(url);
+    if (!node || node.status === "queued" || node.status === "discovered") return [];
+    return [
+      {
+        url: node.url,
+        siteRoot: node.siteRoot,
+        depth: node.depth,
+        status: node.status,
+        snapshotUrl: node.snapshotUrl,
+        snapshotTimestamp: node.snapshotTimestamp,
+        outlinkCount: node.outlinkCount,
+        note: node.note,
+      },
+    ];
+  });
+
+  return {
+    criteria: {
+      seeds,
+      timestamp: params.timestamp,
+      maxDepth,
+      pageBudget,
+      linksPerPage,
+      candidateBudget,
+      externalOnly,
+      keywords,
+      scoring: "URL/アンカーテキストのキーワード一致×10 + 被参照数（最大5）+ 近い深さ",
+    },
+    coverage: {
+      pagesAttempted: attempted.length,
+      pagesExpanded,
+      pendingPages: queue.length,
+      uniqueUrls: nodes.size,
+      uniqueSites: sites.size,
+      discoveredSites: siteResults.filter((site) => !site.seed).length,
+      skippedNonPageLinks,
+      skippedCandidateLinks,
+      pageLinkLimitHits,
+      truncated: reasons.length > 0,
+      reasons,
+    },
+    sites: siteResults,
+    pages: pageResults,
+    failures,
+  };
 }
 
 /** HTML をおおまかにプレーンテキスト化する（当時のページは装飾タグが多いため） */

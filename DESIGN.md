@@ -8,13 +8,13 @@ Retroweb-MCP は、現行検索エンジンの索引から消えた 1990 年代�
 
 | コンポーネント | 責務と境界 |
 | --- | --- |
-| `src/index.ts` | MCP サーバーの起動、11 個のツール登録、Zod 入力検証、結果の JSON テキスト化、例外の MCP エラー化を行う。探索アルゴリズムと HTTP 処理は各モジュールへ委譲する。 |
-| `src/wayback.ts` | CDX の URL 列挙と分割走査、サイト根への集約、Availability/CDX によるスナップショット解決、保存 HTML の取得、本文化、リンク抽出を担う。 |
-| `src/http.ts` | User-Agent、timeout、retry、`Retry-After`、応答破棄、JSON/HTML 取得を共通化する。Shift_JIS、EUC-JP、UTF-8、西欧系文字コードの判定もここに閉じる。 |
+| `src/index.ts` | MCP サーバーの起動、12 個のツール登録、Zod 入力検証、結果の JSON テキスト化、例外の MCP エラー化を行う。探索アルゴリズムと HTTP 処理は各モジュールへ委譲する。 |
+| `src/wayback.ts` | CDX の URL 列挙と分割走査、サイト根への集約、Availability/CDX によるスナップショット解決、保存 HTML の取得、本文化、リンク抽出、予算付きリンク近傍クロールを担う。 |
+| `src/http.ts` | User-Agent、timeout、retry、`Retry-After`、応答破棄、応答バイト上限、JSON/HTML 取得を共通化する。Shift_JIS、EUC-JP、UTF-8、西欧系文字コードの判定もここに閉じる。 |
 | `src/legacy-domains.ts` | 当時のホスト、地域、カテゴリ、商業ノイズ除外、時代特有の言い回しを静的データとして持ち、検索クエリを生成する。 |
 | `src/wiby.ts` | Wiby の JSON API を英語圏の現存する旧式ページ向け全文検索として扱う。アーカイブ探索は担当しない。 |
 | `src/warp.ts` / `src/marginalia.ts` | 自動取得が安定しない検索サービスについて、検索 URL と利用上の制約だけを返す。結果のスクレイピングは行わない。 |
-| `src/smoke.ts` / `src/e2e.ts` | 前者は関数と外部 API の実地スモーク、後者は `dist/index.js` を子プロセス起動する MCP プロトコル結合テストを担う。どちらも実ネットワークへ接続する。 |
+| `src/unit.ts` / `src/smoke.ts` / `src/e2e.ts` | unit は外部ネットワーク不要の回帰、smoke は関数と外部 API の実地確認、e2e は `dist/index.js` を子プロセス起動する MCP プロトコル結合テストを担う。後二者は実ネットワークへ接続する。 |
 | `skills/retroweb/SKILL.md` | 公開ツールを組み合わせる探索手順を、npm パッケージに同梱する。サーバー実装そのものは含まない。 |
 
 サーバーは永続ストレージ、キャッシュ、認証状態を持たない。状態の正本は外部サービスの応答と、リポジトリ内のホスト辞書である。
@@ -23,18 +23,20 @@ Retroweb-MCP は、現行検索エンジンの索引から消えた 1990 年代�
 
 1. MCP クライアントが stdio でツール名と引数を渡し、`src/index.ts` が Zod スキーマで検証する。
 2. 静的なホスト・クエリ・戦略ツールは `legacy-domains.ts` などで同期的に生成し、ネットワークを使わず返す。
-3. アーカイブ探索では `wayback.ts` が `http.ts` 経由で Internet Archive を呼ぶ。広い URL 空間は CDX のブロックを分散走査し、URL をサイト根へ集約して `discover_sites` の結果にする。
+3. アーカイブ探索では `wayback.ts` が `http.ts` 経由で Internet Archive を呼ぶ。`wayback_cdx_search` と `discover_sites` の広い URL 空間は CDX のブロックを分散走査し、後者はさらに URL をサイト根へ集約する。
 4. 個別ページを読む場合は、Availability API でスナップショットを解決し、空応答または失敗時は CDX へフォールバックする。`id_` URL からツールバーなしの HTML を取得し、文字コード判定後に本文またはリンクへ変換する。
-5. 海外の現存ページを内容から探す場合だけ Wiby の JSON API を使う。WARP と Marginalia は検索 URL を返し、閲覧は利用者側に委ねる。
-6. 成功結果は整形済み JSON を MCP の text content として返す。処理例外は利用者向けメッセージへ変換し、`isError: true` を付ける。
+5. 複数段のリンク探索は `crawl_link_neighborhood` が逐次 BFS で行う。深さ、展開ページ、ページ当たりリンク、保持候補に上限を設け、URL を重複排除し、個別失敗を収集して続行する。
+6. 海外の現存ページを内容から探す場合だけ Wiby の JSON API を使う。WARP と Marginalia は検索 URL を返し、閲覧は利用者側に委ねる。
+7. 成功結果は整形済み JSON を MCP の text content として返す。処理例外は利用者向けメッセージへ変換し、`isError: true` を付ける。
 
 ## 重要な不変条件
 
-- 主経路は `discover_sites` でサイト候補を得て、`wayback_snapshot`、`wayback_fetch_page`、`wayback_outlinks` で確認と芋づる探索を行うこと。CDX は URL 索引であり全文検索ではない。
+- 主経路は `discover_sites` でサイト候補を得て、`wayback_fetch_page` で内容を確認し、`crawl_link_neighborhood` で芋づる探索を行うこと。`wayback_snapshot` と `wayback_outlinks` は個別確認用の低レベル操作として残す。CDX は URL 索引であり全文検索ではない。
 - CDX を一部だけ走査した結果は網羅集合として扱わず、`coverage.sampled`、総ブロック数、走査ブロック数を返す。
 - `DiscoveredSite.earliest` は観測した最初のキャプチャ、`latestFirstSeen` は各 URL の初回観測のうち最も遅い時刻である。最終更新や最新キャプチャが必要な場合は snapshot 解決を別に行う。
 - サイト根は、チルダ形式、GeoCities の番地形式、一般ホストの先頭階層を規則で判定する。規則で確定しない中間ディレクトリは、子ディレクトリ数と直下ファイル数から地区か個人サイトかを判定する。
 - アーカイブ内リンクでは Wayback のラッパー URL を元 URL へ戻し、`base` を使って相対解決する。`javascript:`、`mailto:`、`data:`、アーカイブ自身、重複 URL は探索結果から除く。
+- 複数段クロールは最大 3 ホップを逐次処理し、結果が予算で切れた場合は `coverage.truncated` と理由を返す。キーワード得点は URL とアンカーテキストだけを根拠とし、本文一致や検索エンジン非掲載を示すものとして扱わない。
 - MCP サーバーの version と npm package version を一致させる。公開エントリポイントは `dist/index.js`、実行コマンドは `retroweb-mcp` である。
 - npm 公開物にはビルド済みコードと探索 Skill を含め、ソース、テスト、内部設計文書は含めない。
 
@@ -46,6 +48,7 @@ Retroweb-MCP は、現行検索エンジンの索引から消えた 1990 年代�
 | 広い CDX 検索をブロック分割し、URL キー空間へ走査点を分散する | prefix 全体の単純検索は巨大索引を先頭から読み、timeout しやすく結果も偏る。 | 上限内で全ブロックを読めない場合は標本となるため、coverage を明示して再絞り込みを促す。 |
 | サイト根を規則と観測データの両方で決める | GeoCities、Angelfire、ISP でユーザー領域の階層が異なり、ホスト辞書だけでは未知の配置を扱えない。 | 子ディレクトリ 8 件を境にするヒューリスティックは、小さい標本や大規模サイトで誤分類の余地がある。 |
 | Availability API の空応答を CDX で補う | Availability はレート制限時にも HTTP 200 の空オブジェクトを返し、status code だけでは失敗を検出できない。 | 時点指定時は前後の CDX 問い合わせが増えるため、直列実行して追加負荷を抑える。 |
+| リンク近傍を予算付きの逐次 BFS で辿る | 2〜3 段の手動反復は主用途なのに呼び出し側へ状態管理を押し付け、無制限・並列クロールは Archive への過負荷と巨大応答を招く。 | 上限到達時は網羅にならないため、coverage と発見経路を返し、候補を起点に分割して再開できるようにする。 |
 | HTML をバイト列から復号する | 対象年代は charset 宣言が欠落・誤記された Shift_JIS、EUC-JP、西欧語ページが多い。 | 判定はヒューリスティックなので、利用者が `raw=true` で原文を確認できる経路を残す。 |
 | Wiby だけを全文検索ツールにする | 安定した JSON API があり、現存する旧式の英語ページを内容から探せる。 | アーカイブではなく、日本語索引はほぼ無く、1 回 12 件でページングできない。 |
 | WARP と Marginalia は URL 生成に限定する | WARP は JS 描画と API 403、Marginalia は英語専用で HTML 構造が不安定である。 | MCP 内で検索結果を返せず、最終閲覧は利用者の操作になる。 |

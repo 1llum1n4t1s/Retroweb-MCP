@@ -99,7 +99,7 @@ export async function wibySearch(
   }
   if (/[぀-ヿ一-鿿]/.test(trimmed)) {
     notes.push(
-      "⚠ 日本語クエリは Wiby の索引にほぼ存在しません。日本語サイトを探すなら discover_sites / wayback_outlinks を使ってください。",
+      "⚠ 日本語クエリは Wiby の索引にほぼ存在しません。日本語サイトを探すなら discover_sites / crawl_link_neighborhood を使ってください。",
     );
   }
   if (results.length >= WIBY_PAGE_SIZE) {

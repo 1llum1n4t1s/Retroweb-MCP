@@ -31,16 +31,37 @@ Google をはじめとする現行の検索エンジンは、この年代の個�
 | ツール | 用途 |
 | --- | --- |
 | `discover_sites` | **主力**。ホスト配下に存在した個人サイトをユーザー単位で列挙する |
-| `wayback_cdx_search` | アーカイブ済み URL をファイル単位で列挙する |
+| `wayback_cdx_search` | アーカイブ済み URL をファイル単位で列挙する。広い指定は分割走査し `coverage` を返す |
 | `wayback_snapshot` | 指定時点に最も近いスナップショットを解決する |
 | `wayback_fetch_page` | 保存済みページ本文を取得（Shift_JIS / EUC-JP / Latin-1 自動判別） |
-| `wayback_outlinks` | ページから外部リンクを抽出（芋づる発掘の中核） |
+| `wayback_outlinks` | 1 ページから外部リンクを抽出する低レベル操作 |
+| `crawl_link_neighborhood` | **芋づる発掘の主力**。起点から最大 3 段を予算付きで自動探索する |
 | `legacy_hosts` | 当時のホスティング・ISP・ディレクトリの辞書（94 件 / `region` で日本・海外を切替） |
 | `build_retro_queries` | `site:` 絞り込みと当時の言い回しによる検索クエリ生成（日英） |
 | `wiby_search` | **海外専用**。旧式ページだけを索引する検索エンジンの全文検索（後述） |
 | `retro_search_strategy` | 探索手順そのものを返す。迷ったら最初に呼ぶ（`region` で分岐） |
 | `warp_search_url` | 国立国会図書館 WARP の検索 URL 生成（取得は不可、後述） |
 | `marginalia_search_url` | Marginalia の検索 URL 生成（英語専用、後述） |
+
+## 検索に出ない周辺サイトを自動で掘る
+
+リンク集・人力ディレクトリ・Web リングの URL が 1 件でも分かれば、
+`crawl_link_neighborhood` が最寄りの Wayback スナップショットを解決し、リンクを幅優先で辿る。
+
+```json
+{
+  "seeds": ["http://www.example.ne.jp/~someone/links.html"],
+  "timestamp": "1999",
+  "maxDepth": 2,
+  "pageBudget": 8,
+  "keywords": ["自作CG", "イラスト"]
+}
+```
+
+結果の `sites` にはサイト根、発見元ページ、アンカーテキスト、起点からの `route`、
+確認できたスナップショットが入る。`score` のキーワード判定は URL とアンカーテキストだけで、
+本文検索や現行検索エンジンの非掲載判定ではない。`coverage.truncated` が `true` の場合は
+`reasons` を見て、上限を増やすか高得点の候補を次の `seeds` にして探索を分割する。
 
 ## 海外サイトの探索
 
@@ -105,7 +126,7 @@ Angelfire は `/<地区コード>/<ユーザー>/` と中間ディレクトリ�
 
 ### 広い指定でも落とさない（CDX ページ分割 API）
 
-`discover_sites` に `www.geocities.co.jp` のようなホスト名だけを渡すと、CDX は索引の
+`wayback_cdx_search` または `discover_sites` に `www.geocities.co.jp` のようなホスト名だけを渡すと、CDX は索引の
 先頭から該当行を探し続け、Internet Archive 側の nginx が 60 秒で 504 を返す。
 `limit` を下げても始点が変わらないので解決しない。
 
@@ -115,7 +136,7 @@ Angelfire は `/<地区コード>/<ユーザー>/` と中間ディレクトリ�
 
 ブロックは URL キー順に並ぶので、先頭から順に読むと辞書順で先頭のエリアに偏る。
 **範囲全体へ等間隔にブロックを散らし、件数の予算も各ブロックへ均等に配る**。
-結果はホスト全体からの**標本**になるため、`coverage.sampled` で網羅でないことを明示する。
+結果はホスト全体からの**標本**になるため、両ツールとも `coverage.sampled` で網羅でないことを明示する。
 
 実測（`www.geocities.co.jp`、1997〜2002）: 23001 ブロック中 12 ブロックを読み、
 **12 エリアにまたがる 226 サイトを 6 秒**で列挙。
@@ -132,13 +153,14 @@ Angelfire は `/<地区コード>/<ユーザー>/` と中間ディレクトリ�
 2. 全クエリの末尾に `-site:shopping.geocities.jp` など商業ドメインの除外句を付ける。
 
 なおこの経路自体の期待値は低い。当時のホストはほぼ索引から消えているため、
-実際に届くのは `discover_sites` → `wayback_outlinks` の芋づるのほう。
+実際に届くのは `discover_sites` → `crawl_link_neighborhood` の芋づるのほう。
 
 ### 文字コード
 
 当時の日本語ページは Shift_JIS / EUC-JP が主流で、`meta charset` を持たないものも多い
 （1997 年の Yahoo! JAPAN トップは meta 無し）。`res.text()` は UTF-8 決め打ちのため
-そのままでは全文が化ける。本サーバはヘッダ → meta → **バイト分布からの推定**の順で判定する。
+そのままでは全文が化ける。本サーバはヘッダ → meta → **バイト分布からの推定**の順で判定し、
+明示された有効な charset（`windows-1252` / `cp1252` / `latin1` / `iso-8859-15` など）は推定より優先する。
 
 海外ページを対象にすると、この推定が逆向きに誤爆する。
 

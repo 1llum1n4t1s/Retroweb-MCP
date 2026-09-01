@@ -82,6 +82,8 @@ discover_sites(url="www.angelfire.com", from="1999", to="2002")
   `maxRecords` を上げるか、その地区を prefix にして呼び直す。
 
 `wayback_cdx_search` はファイル単位で返るため、1 サイトの画像群で件数を食い潰す。
+prefix / host / domain の広い指定は CDX ブロックを分散走査し、結果が標本なら
+`coverage.sampled=true` になる。URL・年代を絞るか `limit` を上げて深掘りする。
 **サイトを探す目的では必ず `discover_sites` を使う。**
 
 ### 3. 中身を読む
@@ -91,17 +93,30 @@ wayback_snapshot(url=<siteRoot>, timestamp="2000")   # 最寄りのスナップ�
 wayback_fetch_page(url=<siteRoot>, timestamp=<ts>)   # 本文（文字コード自動判別）
 ```
 
-Shift_JIS / EUC-JP は自動で復号される。海外の Latin-1（独語のウムラウト、仏語のアクセント）と
+Shift_JIS / EUC-JP は自動で復号される。宣言された windows-1252 / Latin-1 系文字コード、
+海外の Latin-1（独語のウムラウト、仏語のアクセント）と
 `&eacute;` 形式の実体参照も復号される。それでも化ける場合は `raw=true` で `meta charset` を確認する。
 
 ### 4. 芋づる（ここで検索不可能な領域へ入る）
 
 ```
-wayback_outlinks(url=<siteRoot>, timestamp=<ts>, externalOnly=true)
+crawl_link_neighborhood(
+  seeds=[<リンク集やディレクトリのURL>],
+  timestamp="2000",
+  maxDepth=2,
+  pageBudget=8,
+  keywords=[<主題語>]
+)
 ```
 
 当時のサイトはほぼ必ず「リンク」ページを持つ。そこを辿ると相互リンク先へ広がる。
-**2〜3 段辿ると、どの検索エンジンにも存在しないサイトに届く。**
+**2〜3 段辿ると、現行の通常検索では見つけにくいサイトへ届きやすい。**
+`sites` の `route` と `discoveredFrom` で発見経路を確認し、`snapshot` がある候補から本文を読む。
+`coverage.truncated=true` なら `reasons` を確認し、必要な予算だけ増やすか、高得点候補を次の
+`seeds` にして探索を分割する。`keywords` は URL とアンカーテキストの順位付けであり、本文検索ではない。
+
+1 ページのリンクだけを確認したい場合は、低レベル操作の
+`wayback_outlinks(url=<siteRoot>, timestamp=<ts>, externalOnly=true)` を使う。
 
 効果が高い起点（日本語圏）:
 - サイト内の `link.html` / `link.htm` / `links/`（`wayback_cdx_search` で探す）
@@ -122,7 +137,7 @@ wiby_search(query="amiga demoscene")
 
 Wiby は昔ながらの手打ちページだけを人手で索引している検索エンジンで、
 **本 MCP で唯一、内容から探せる経路**。海外の主題ならまずこれを叩いて起点を掴み、
-出てきた URL を `wayback_outlinks` に渡して当時のリンク集へ遡る。
+出てきた URL を `crawl_link_neighborhood` の `seeds` に渡して当時のリンク集へ遡る。
 
 制約: 索引対象は**今も生きている**旧式ページ（アーカイブではない）／英語専用／
 1 回 12 件でページング不可（続きが要るなら語を変えて呼び直す）。

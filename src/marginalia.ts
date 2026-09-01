@@ -43,7 +43,7 @@ export function buildMarginaliaQuery(query: string): MarginaliaQueryPlan {
       "個人サイト保存プロジェクトや、当時を扱った英語圏のリンク集を探すこと",
     ],
     alternatives: [
-      "日本語の古い個人サイトそのものを探すなら wayback_cdx_search と wayback_outlinks を使う。",
+      "日本語の古い個人サイトそのものを探すなら discover_sites と crawl_link_neighborhood を使う。",
       "現行検索エンジンで粘るなら build_retro_queries で site: クエリを生成して WebSearch に渡す。",
     ],
   };

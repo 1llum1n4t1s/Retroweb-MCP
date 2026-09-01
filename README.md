@@ -1,4 +1,6 @@
-# Retroweb MCP
+# @kagayoi/retroweb-mcp
+
+[![npm version](https://img.shields.io/npm/v/@kagayoi/retroweb-mcp)](https://www.npmjs.com/package/@kagayoi/retroweb-mcp)
 
 90 年代〜2000 年代前半の**個人サイト**を Web アーカイブから発掘するための MCP サーバ。
 **日本語圏と海外（英語圏・欧州・豪州）の双方**に対応する。
@@ -153,11 +155,32 @@ Angelfire は `/<地区コード>/<ユーザー>/` と中間ディレクトリ�
 
 ## セットアップ
 
+npm の最新版を使う場合:
+
+```bash
+claude mcp add retroweb -- npx --yes @kagayoi/retroweb-mcp@latest
+```
+
+MCP クライアントへ直接設定する場合:
+
+```json
+{
+  "mcpServers": {
+    "retroweb": {
+      "command": "npx",
+      "args": ["--yes", "@kagayoi/retroweb-mcp@latest"]
+    }
+  }
+}
+```
+
+ローカル clone から開発する場合:
+
 ```bash
 pnpm install && pnpm build
 ```
 
-Claude Code への登録:
+ローカル build を Claude Code へ登録:
 
 ```bash
 claude mcp add retroweb -- node C:/Users/IMT/dev/Retroweb-MCP/dist/index.js

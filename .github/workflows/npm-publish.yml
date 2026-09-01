@@ -1,0 +1,52 @@
+name: Publish to npm
+
+# npm publish は GitHub Secret の NPM_TOKEN（npmjs.com の Automation token）で認証する。
+# release/x.y.z ブランチの push、または手動実行で発火する。
+
+on:
+  push:
+    branches:
+      - "release/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: pnpm セットアップ
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: "pnpm"
+
+      - name: release ブランチと package version を照合
+        if: startsWith(github.ref_name, 'release/')
+        run: |
+          BR="${GITHUB_REF_NAME#release/}"
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$BR" != "$PKG" ]; then
+            echo "::error::Release branch '$BR' does not match package.json version '$PKG'"
+            exit 1
+          fi
+          echo "Release branch and package.json agree on $PKG"
+
+      - name: 依存関係をインストール
+        run: pnpm install --frozen-lockfile
+
+      - name: ビルド
+        run: pnpm run build
+
+      - name: npm へ公開
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

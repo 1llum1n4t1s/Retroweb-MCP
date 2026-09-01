@@ -11,6 +11,7 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "unit": "tsx src/unit.ts",
     "smoke": "tsx src/smoke.ts",
     "e2e": "pnpm build && tsx src/e2e.ts",
     "lint": "tsc --noEmit"
@@ -48,11 +49,11 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "zod": "^4.5.1"
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
-    "tsx": "^4.23.12",
+    "tsx": "^4.23.13",
     "typescript": "^7.0.2"
   }
 }

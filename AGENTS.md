@@ -6,7 +6,7 @@
 
 - Node.js 20 以上と pnpm 11 を使い、依存関係は `pnpm-lock.yaml` に固定する。
 - `src/index.ts` は stdio MCP サーバーと公開ツールのスキーマを定義する。外部サービス連携とドメイン知識は `src/` の各モジュールへ置く。
-- `src/smoke.ts` は関数・外部 API の実地確認、`src/e2e.ts` はビルド済みサーバーの MCP 結合確認を担う。
+- `src/unit.ts` は外部ネットワーク不要の回帰確認、`src/smoke.ts` は関数・外部 API の実地確認、`src/e2e.ts` はビルド済みサーバーの MCP 結合確認を担う。
 - `dist/` と `node_modules/` は生成物である。ソースとして編集せず、必要なときに build または install で再生成する。
 - npm パッケージには `dist/`、`skills/`、`LICENSE`、`README.md` が含まれる。公開ツールの手順を変えたときは `skills/retroweb/SKILL.md` も同じ契約へ更新する。
 
@@ -31,6 +31,7 @@ pnpm install --frozen-lockfile
 ソースまたは設定を変更したときの基本検証:
 
 ```powershell
+pnpm unit
 pnpm lint
 pnpm build
 ```

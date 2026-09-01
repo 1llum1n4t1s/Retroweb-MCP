@@ -43,6 +43,12 @@ jobs:
       - name: 依存関係をインストール
         run: pnpm install --frozen-lockfile
 
+      - name: unit テスト
+        run: pnpm unit
+
+      - name: lint
+        run: pnpm lint
+
       - name: ビルド
         run: pnpm run build
 

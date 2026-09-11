@@ -49,4 +49,4 @@ pnpm e2e
 
 - `.github/workflows/npm-publish.yml` は `release/x.y.z` への push または手動実行で、public package `@kagayoi/retroweb-mcp` を公開する。
 - release ブランチ名の `x.y.z` と `package.json` の version を一致させる。
-- 公開認証は GitHub Secret `NPM_TOKEN` から `NODE_AUTH_TOKEN` へ渡す。秘密値をファイル、ログ、commit に含めない。
+- 公開認証はnpm Trusted PublishingとGitHub OIDCを使う。長期npmトークンをGitHub Secret、ファイル、ログ、commitに含めない。

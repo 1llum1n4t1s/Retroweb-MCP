@@ -1,6 +1,6 @@
 name: Publish to npm
 
-# npm publish は GitHub Secret の NPM_TOKEN（npmjs.com の Automation token）で認証する。
+# npm publish は npm Trusted Publishing の OIDC 認証を使う。
 # release/x.y.z ブランチの push、または手動実行で発火する。
 
 on:
@@ -11,23 +11,28 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: pnpm セットアップ
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6
         with:
           version: 11
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
           cache: "pnpm"
+
+      - name: OIDC対応npm CLIを準備
+        run: npm install --global npm@11.19.1
 
       - name: release ブランチと package version を照合
         if: startsWith(github.ref_name, 'release/')
@@ -53,6 +58,4 @@ jobs:
         run: pnpm run build
 
       - name: npm へ公開
-        run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance --registry=https://registry.npmjs.org/
